@@ -1,0 +1,1137 @@
+# winperf_gui_clean.py - patched
+# Cleaned and merged version of your original Performance Monitor GUI.
+# Patch: fixes repeated "dataChanged() called with an invalid index range" by
+# ensuring we never write past the table's column count when populating rows.
+# Windows-ready. Requires psutil and PyQt6.
+
+import sys
+import os
+import psutil
+import shutil
+import platform
+import subprocess
+import winreg
+from datetime import datetime
+from functools import partial
+
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QTableWidget,
+    QTableWidgetItem,
+    QPushButton,
+    QLabel,
+    QTabWidget,
+    QGroupBox,
+    QSpinBox,
+    QMenu,
+    QMessageBox,
+    QTextEdit,
+    QHeaderView,
+    QToolButton,
+)
+from PyQt6.QtGui import QColor, QFont, QAction
+from PyQt6.QtCore import Qt, QTimer
+
+# Optional WMI import (if present). Not required.
+try:
+    import wmi
+except Exception:
+    wmi = None
+
+APP_TITLE = "Century EVO Performance Monitor"
+REPORT_FILE = "performance_report_gui.txt"
+REFRESH_MS_DEFAULT = 5000  # 5 seconds
+
+# -----------------------
+# Utility helpers
+# -----------------------
+
+def bytes_to_gb(n):
+    try:
+        return round(n / (1024 ** 3), 2)
+    except Exception:
+        return 0.0
+
+
+def is_system_process_name(name):
+    if not name:
+        return True
+    low = name.lower()
+    if "idle" in low or low in ("system", "system idle process", "ntoskrnl.exe"):
+        return True
+    return False
+
+
+def backup_registry_value(hive, path, name, backup_dir="startup_backups"):
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        with winreg.OpenKey(hive, path) as key:
+            val, t = winreg.QueryValueEx(key, name)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = f"{name}_{timestamp}.reg"
+        dest = os.path.join(backup_dir, safe_name)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(f"Name: {name}\nValue: {val}\nType: {t}\n")
+        return dest
+    except Exception:
+        return None
+
+
+# -----------------------
+# Suggestion Engine
+# -----------------------
+
+class SuggestionEngine:
+    def __init__(self):
+        self.svc_cpu_threshold = 3.0
+        self.svc_mem_threshold = 5.0
+        self.startup_cpu_threshold = 5.0
+        self.startup_mem_threshold = 5.0
+        # Auto-learning storage
+        self.pref_file = "user_prefs.json"
+        if os.path.exists(self.pref_file):
+            with open(self.pref_file, "r") as f:
+                self.user_prefs = json.load(f)
+        else:
+            self.user_prefs = {"whitelist": [], "blacklist": []}
+            
+    def save_prefs(self):
+        with open(self.pref_file, "w") as f:
+            json.dump(self.user_prefs, f, indent=2)            
+
+    def list_registry_startup(self):
+        results = []
+        reg_paths = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        ]
+        for hive, path in reg_paths:
+            try:
+                with winreg.OpenKey(hive, path) as key:
+                    i = 0
+                    while True:
+                        try:
+                            name, value, _ = winreg.EnumValue(key, i)
+                            results.append((hive, path, name, value))
+                            i += 1
+                        except OSError:
+                            break
+            except Exception:
+                continue
+
+        if wmi:
+            try:
+                c = wmi.WMI()
+                for s in c.Win32_StartupCommand():
+                    results.append((None, None, s.Name, s.Command))
+            except Exception:
+                pass
+
+        return results
+
+    def list_services(self):
+        services = []
+        try:
+            for svc in psutil.win_service_iter():
+                try:
+                    services.append(svc.as_dict())
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return services
+
+    def scan_for_suggestions(self, proc_map):
+        """
+        Smart suggestion engine:
+        1. Dynamic scoring system (CPU, RAM, Disk, Net, risk).
+        2. Category-based actions (mapped automatically).
+        3. Auto-learning feedback loop (whitelist/blacklist).
+        4. Context-aware filtering (battery, disk space, fullscreen).
+        """
+
+        suggestions = []
+
+        # === Ensure prefs always exist ===
+        if not hasattr(self, "user_prefs"):
+            self.user_prefs = {"whitelist": [], "blacklist": []}
+
+        whitelist = set(self.user_prefs.get("whitelist", []))
+        blacklist = set(self.user_prefs.get("blacklist", []))
+
+        def score_item(cpu, mem, disk=0, net=0, startup=False, suspicious=False):
+            """Weighted score calculation."""
+            base = (cpu * 2) + (mem * 0.5) + (disk * 0.3) + (net * 0.3)
+            if startup:
+                base += 15
+            if suspicious:
+                base += 20
+            return min(100, int(base))
+
+        # === Context-aware modifiers ===
+        try:
+            battery = psutil.sensors_battery()
+            disk_usage = shutil.disk_usage("C:\\") if os.name == 'nt' else shutil.disk_usage(os.path.expanduser("~"))
+            disk_pct = (disk_usage.used / disk_usage.total) * 100
+            fullscreen = self.is_fullscreen_app_running()
+        except Exception:
+            battery, disk_pct, fullscreen = None, 50, False
+
+        # --- Registry Startup ---
+        for entry in self.list_registry_startup():
+            hive, path, name, cmd = entry
+
+            if name in whitelist:
+                continue  # Skip safe apps
+            suspicious = "update" not in name.lower() and "microsoft" not in cmd.lower()
+
+            matched = None
+            for pid, info in proc_map.items():
+                nm = info[0] or ""
+                if name.lower() in nm.lower() or (cmd and nm.lower() in str(cmd).lower()):
+                    matched = (pid, info)
+                    break
+
+            if matched:
+                pid, info = matched
+                cpu = info[1] if len(info) > 1 else 0
+                mem = info[2] if len(info) > 2 else 0
+                disk_kb = info[4] if len(info) > 4 else 0
+                net_ops = info[5] if len(info) > 5 else 0
+                s = score_item(cpu, mem, disk_kb, net_ops, startup=True, suspicious=suspicious)
+
+                # Context boosts
+                if battery and battery.percent < 20:
+                    s += 10
+                if disk_pct > 90:
+                    s += 10
+
+                if name in blacklist or s >= 60:
+                    suggestions.append(
+                        (
+                            name,
+                            "Startup App",
+                            f"PID {pid} | CPU {cpu:.1f}% | RAM {mem:.1f} MB | [Score {s}]",
+                            "🔴 Disable from startup (backup recommended)",
+                            partial(self.disable_startup_entry, hive, path, name),
+                        )
+                    )
+                else:
+                    suggestions.append(
+                        (
+                            name,
+                            "Startup App",
+                            f"PID {pid} | [Score {s}] | Cmd: {cmd}",
+                            "ℹ️ Optional: disable if unnecessary",
+                            lambda: (False, "Safe – no auto action"),
+                        )
+                    )
+            else:
+                # Always include a score, even if not running
+                s = 0 if name in whitelist else 20
+                suggestions.append(
+                    (
+                        name,
+                        "Startup App",
+                        f"[Score {s}] Not running | Cmd: {cmd}",
+                        "ℹ️ Can disable from startup if not needed",
+                        partial(self.disable_startup_entry, hive, path, name),
+                    )
+                )
+
+        # --- Services ---
+        for svc in self.list_services():
+            try:
+                svc_name = svc.get("name") or svc.get("display_name") or ""
+                binpath = svc.get("binpath", "") or svc.get("path", "")
+
+                if svc_name in whitelist:
+                    continue
+
+                suspicious = "unknown" in svc_name.lower() or "temp" in binpath.lower()
+
+                matched = None
+                for pid, info in proc_map.items():
+                    nm = info[0] or ""
+                    if nm and nm.lower() in str(binpath).lower():
+                        matched = (pid, info)
+                        break
+
+                if matched:
+                    pid, info = matched
+                    cpu = info[1]
+                    mem = info[2]
+                    disk_kb = info[4] if len(info) > 4 else 0
+                    net_ops = info[5] if len(info) > 5 else 0
+                    s = score_item(cpu, mem, disk_kb, net_ops, suspicious=suspicious)
+
+                    if fullscreen and s < 70:
+                        s -= 15
+
+                    if svc_name in blacklist or s >= 50:
+                        suggestions.append(
+                            (
+                                svc_name,
+                                "Service",
+                                f"PID {pid} | CPU {cpu:.1f}% | RAM {mem:.1f} MB | [Score {s}]",
+                                "⚠️ Stop & disable service (if non-critical)",
+                                partial(self.stop_and_disable_service, svc_name),
+                            )
+                        )
+                    else:
+                        suggestions.append(
+                            (
+                                svc_name,
+                                "Service",
+                                f"PID {pid} | [Score {s}] | Running safely",
+                                "ℹ️ Leave running (safe)",
+                                lambda: (False, "Service safe – no action"),
+                            )
+                        )
+                else:
+                    s = 0
+                    suggestions.append(
+                        (
+                            svc_name,
+                            "Service",
+                            f"[Score {s}] Not active | BinPath: {binpath}",
+                            "ℹ️ Optional: disable from services.msc",
+                            lambda: (False, "Service not active"),
+                        )
+                    )
+            except Exception:
+                continue
+
+        # --- Sorting: highest score first ---
+        def _extract_score(txt):
+            try:
+                if "Score" in str(txt):
+                    return int(str(txt).split("Score")[-1].split("]")[0].strip())
+                return 0
+            except Exception:
+                return 0
+
+        suggestions.sort(key=lambda x: _extract_score(x[2]), reverse=True)
+
+        if not suggestions:
+            suggestions.append(("System OK", "Info", "-", "✅ No actionable suggestions found", lambda: (False, "No action")))
+
+        return suggestions
+
+    def disable_startup_entry(self, hive, path, name):
+        try:
+            backup = backup_registry_value(hive, path, name)
+            with winreg.OpenKey(hive, path, 0, winreg.KEY_ALL_ACCESS) as key:
+                winreg.DeleteValue(key, name)
+            return True, f"Startup entry removed: {name}\nBackup: {backup}"
+        except Exception as e:
+            return False, f"Failed to remove startup entry: {e}"
+
+    def stop_and_disable_service(self, svc_name):
+        try:
+            subprocess.run(["sc", "stop", svc_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["sc", "config", svc_name, "start=", "disabled"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return True, f"Service {svc_name} stop/disable attempted."
+        except Exception as e:
+            return False, f"Failed to stop/disable service: {e}"
+
+
+# -----------------------
+# Main GUI
+# -----------------------
+
+class PerformanceMonitorGUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1100, 810)
+        self.setFont(QFont("Consolas", 10))
+
+        self.refresh_interval_ms = REFRESH_MS_DEFAULT
+        self.prev_disk = {}
+        self.prev_net = {}
+        self.prev_disk_io = None
+        self.proc_map = {}
+        self.sugg = SuggestionEngine()
+
+        self._build_ui()
+
+        # ✅ Apply dark neon stylesheet globally
+        self.setStyleSheet(
+            """
+        QMainWindow { background-color: #000; }
+        QWidget { background-color: #000; color: #39FF14; }
+        QTabWidget::pane { border: 1px solid #39FF14; background: #000; }
+        QTabBar::tab { background: #111; color: #39FF14; padding: 6px 12px; border: 1px solid #39FF14; }
+        QTabBar::tab:selected { background: #39FF14; color: #000; }
+        QTableWidget { background-color: #000; alternate-background-color: #000; color: #39FF14; gridline-color: #39FF14; selection-background-color: #39FF14; selection-color: #000; }
+        QHeaderView::section { background-color: #111; color: #fff; border: 1px solid #39FF14; padding: 4px; }
+        QToolButton { background-color: #000; color: #39FF14; border: 1px solid #39FF14; padding: 3px 8px; }
+        QToolButton:hover { background-color: #39FF14; color: #000; }
+        QMenu { background-color: #000; color: #39FF14; border: 1px solid #39FF14; }
+        QMenu::item:selected { background-color: #39FF14; color: #000; }
+        QTextEdit, QPlainTextEdit { background-color: #000; color: #39FF14; border: 1px solid #39FF14; }
+        QLabel { color: #39FF14; }
+        QPushButton { background-color: #111; color: #39FF14; border: 1px solid #39FF14; padding: 4px 10px; }
+        QPushButton:hover { background-color: #39FF14; color: #000; }
+        """
+        )
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._refresh_dashboard)
+        self.timer.start(self.refresh_interval_ms)
+
+    def _build_ui(self):
+        self.tabs = QTabWidget()
+        self._build_dashboard_tab()
+        self._build_top_performance_tab()
+        self._build_services_tab()
+        self._build_suggestions_tab()
+
+        main_layout = QVBoxLayout()
+        title = QLabel("Windows Performance Monitor")
+        title.setFont(QFont("Consolas", 12))
+        main_layout.addWidget(title)
+        main_layout.addWidget(self.tabs)
+        self.setLayout(main_layout)
+
+    def _build_dashboard_tab(self):
+        dash = QWidget()
+        layout = QVBoxLayout(dash)
+
+        info_box = QGroupBox()
+        info_layout = QHBoxLayout()
+        self.sys_info_label = QLabel("Loading system info…")
+        info_layout.addWidget(self.sys_info_label)
+
+        ctrl_layout = QHBoxLayout()
+        ctrl_layout.addWidget(QLabel("Refresh (s):"))
+        self.spin_refresh = QSpinBox()
+        self.spin_refresh.setRange(1, 60)
+        self.spin_refresh.setValue(self.refresh_interval_ms // 1000)
+        self.spin_refresh.valueChanged.connect(self._on_refresh_change)
+        ctrl_layout.addWidget(self.spin_refresh)
+
+        self.btn_export = QPushButton("Export Report")
+        self.btn_export.clicked.connect(self._export_report)
+        ctrl_layout.addWidget(self.btn_export)
+
+        info_layout.addLayout(ctrl_layout)
+        info_box.setLayout(info_layout)
+        layout.addWidget(info_box)
+
+        self.table_dashboard = QTableWidget()
+        self.table_dashboard.setColumnCount(8)
+        self.table_dashboard.setHorizontalHeaderLabels(
+            ["PID", "Name", "CPU %", "MEM %", "Disk R/W KB", "Net Ops", "Score", "Path(Hidden)"]
+        )
+        self.table_dashboard.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_dashboard.setColumnHidden(7, True)
+        self.table_dashboard.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table_dashboard.customContextMenuRequested.connect(self._show_proc_context_menu)
+        self.table_dashboard.cellClicked.connect(self._proc_table_show_info)
+        layout.addWidget(self.table_dashboard)
+
+        culpl = QHBoxLayout()
+        self.label_culprit = QLabel("Selected Process: (none)")
+        culpl.addWidget(self.label_culprit)
+        culpl.addStretch()
+        self.btn_kill = QPushButton("Kill Selected Process")
+        self.btn_kill.clicked.connect(self._kill_selected_process)
+        culpl.addWidget(self.btn_kill)
+        layout.addLayout(culpl)
+
+        self.tabs.addTab(dash, "Dashboard")
+
+    def _build_top_performance_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.top_perf_table = QTableWidget()
+        self.top_perf_table.setColumnCount(8)
+        self.top_perf_table.setHorizontalHeaderLabels(
+            ["Metric", "PID", "Name", "CPU %", "MEM %", "Disk KB", "Net Ops", "Score"]
+        )
+        self.top_perf_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        # Neon Dark Theme Styling
+        self.top_perf_table.setStyleSheet(
+            """
+        QTableWidget { background-color: #000000; color: #39FF14; /* Neon Green */ gridline-color: #222; font: 10pt "Consolas"; selection-background-color: #111; selection-color: #FFFFFF; }
+        QHeaderView::section { background-color: #111; color: #39FF14; padding: 4px; border: 1px solid #222; font: bold 10pt "Consolas"; }
+        """
+        )
+        # Store partition indices for later insertion in update function
+        self.partition_rows = {5, 11, 16}
+        layout.addWidget(self.top_perf_table)
+        self.tabs.addTab(tab, "Top Performance")
+
+    def _build_services_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        btn_refresh = QPushButton("Refresh Services")
+        btn_refresh.clicked.connect(self._update_services_tab)
+        layout.addWidget(btn_refresh)
+        self.table_services = QTableWidget()
+        self.table_services.setColumnCount(6)
+        self.table_services.setHorizontalHeaderLabels(
+            ["Service", "Status", "PID", "CPU%", "RAM%", "Actions"]
+        )
+        layout.addWidget(self.table_services)
+        self.tabs.addTab(tab, "Services")
+
+    def _build_suggestions_tab(self):
+        sug = QWidget()
+        layout = QVBoxLayout(sug)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Improvement Suggestions:"))
+        self.btn_refresh_suggestions = QPushButton("Refresh Suggestions")
+        self.btn_refresh_suggestions.clicked.connect(self._refresh_suggestions)
+        top.addWidget(self.btn_refresh_suggestions)
+        top.addStretch()
+        layout.addLayout(top)
+        self.table_suggestions = QTableWidget()
+        self.table_suggestions.setColumnCount(5)
+        self.table_suggestions.setHorizontalHeaderLabels(
+            ["Name", "Type", "Usage", "Suggestion", "Action"]
+        )
+        layout.addWidget(self.table_suggestions)
+        self.suggestions_status = QTextEdit()
+        self.suggestions_status.setReadOnly(True)
+        self.suggestions_status.setFixedHeight(120)
+        layout.addWidget(self.suggestions_status)
+        self.tabs.addTab(sug, "Suggestions")
+
+    # -----------------------
+    # Data gathering
+    # -----------------------
+
+    def _gather_proc_scores(self):
+        """
+        Returns:
+            proc_map: pid -> (name, cpu% , mem%, disk_bytes_delta, net_ops, score)
+            results: list of tuples (pid, name, cpu, mem, disk_kb_str, net_ops_str, score_str, exe_path, score_numeric, disk_bytes_total, net_ops)
+        """
+        proc_map = {}
+        results = []
+
+        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'exe']):
+            try:
+                pid = proc.info['pid']
+                name = proc.info.get('name') or ""
+                if is_system_process_name(name):
+                    continue
+
+                cpu = proc.info.get('cpu_percent') or 0.0
+                mem = proc.info.get('memory_percent') or 0.0
+
+                # --- Disk I/O counters ---
+                try:
+                    io = proc.io_counters()
+                    read_b = (io.read_bytes or 0)
+                    write_b = (io.write_bytes or 0)
+                except Exception:
+                    read_b = 0
+                    write_b = 0
+
+                prev = self.prev_disk.get(pid, (0, 0))
+                delta_read = max(0, read_b - prev[0])
+                delta_write = max(0, write_b - prev[1])
+                self.prev_disk[pid] = (read_b, write_b)
+                disk_bytes_delta = delta_read + delta_write
+
+                # --- Network ops (approx) ---
+                net_ops = 0
+                try:
+                    other = getattr(io, 'other_count', 0)
+                    readcount = getattr(io, 'read_count', 0)
+                    prev_net = self.prev_net.get(pid, (0, 0))
+                    net_ops = max(0, (other - prev_net[0]) + (readcount - prev_net[1]))
+                    self.prev_net[pid] = (other, readcount)
+                except Exception:
+                    net_ops = 0
+
+                # --- Score ---
+                disk_kb = disk_bytes_delta / 1024.0
+                disk_score = (disk_kb / 1024.0) * 1.0
+                net_score = (net_ops / 50.0) * 0.5
+                score_numeric = (cpu * 2.0) + (mem * 1.5) + disk_score + net_score
+
+                # --- Executable path ---
+                exe_path = ""
+                try:
+                    exe_path = proc.info.get("exe") or ""
+                    if not exe_path:
+                        exe_path = proc.exe()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    exe_path = ""
+                except Exception:
+                    exe_path = ""
+
+                proc_map[pid] = (name, cpu, mem, disk_bytes_delta, net_ops, score_numeric)
+                results.append(
+                    (
+                        pid,
+                        name,
+                        cpu,
+                        mem,
+                        f"{int(disk_kb)} KB/s",
+                        f"{int(net_ops)} ops",
+                        f"{score_numeric:.2f}",
+                        exe_path,
+                        score_numeric,
+                        disk_bytes_delta,
+                        net_ops,
+                    )
+                )
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        return proc_map, results
+
+    # -----------------------
+    # Table population
+    # -----------------------
+
+    def get_score_color(self, score):
+        try:
+            s = float(score)
+        except Exception:
+            s = 0.0
+        if s >= 90:
+            return QColor("#5a0000")
+        if s >= 75:
+            return QColor("#7f3f00")
+        if s >= 50:
+            return QColor("#556b00")
+        if s >= 25:
+            return QColor("#004400")
+        return QColor("#002200")
+
+    def _populate_table(self, table: QTableWidget, data):
+        """
+        Safely populate QTableWidget with process data.
+        Prevents Qt invalid index warnings when data is empty or when an item tuple
+        contains more fields than the table has columns (this was causing setItem
+        with out-of-range column indexes and Qt to emit invalid dataChanged ranges).
+        """
+        table.blockSignals(True)
+
+        # If there's no data, clear the table and return cleanly
+        if not data:
+            table.clearContents()
+            table.setRowCount(0)
+            table.blockSignals(False)
+            return
+
+        col_count = table.columnCount()
+        table.setRowCount(len(data))
+
+        for row, item in enumerate(data):
+            # Defensive: ensure item is a sequence and has expected indices
+            score_val = item[6] if (isinstance(item, (list, tuple)) and len(item) > 6) else 0
+            color = self.get_score_color(score_val)
+
+            # Only write up to the available columns in the table to avoid invalid indexes
+            for col in range(col_count):
+                try:
+                    val = item[col]
+                except Exception:
+                    val = ""
+
+                # Format CPU% (col=2) and MEM% (col=3) with 1 decimal place when float
+                if isinstance(val, float) and col in (2, 3):
+                    display = f"{val:.1f}"
+                else:
+                    display = str(val)
+
+                table_item = QTableWidgetItem(display)
+                table_item.setBackground(color)
+                table_item.setForeground(QColor("#fff"))
+                table.setItem(row, col, table_item)
+
+        table.blockSignals(False)
+
+    # -----------------------
+    # Dashboard refresh (single entrypoint)
+    # -----------------------
+
+    def _refresh_dashboard(self):
+        try:
+            # --- System Info (top bar) ---
+            try:
+                cpu = psutil.cpu_percent(interval=0.2)
+                mem = psutil.virtual_memory()
+                disk = shutil.disk_usage("C:\\") if os.name == 'nt' else shutil.disk_usage(os.path.expanduser("~"))
+                io = psutil.disk_io_counters()
+
+                if io:
+                    if self.prev_disk_io is None:
+                        io_rate = 0.0
+                    else:
+                        delta_read = io.read_bytes - self.prev_disk_io.read_bytes
+                        delta_write = io.write_bytes - self.prev_disk_io.write_bytes
+                        interval_s = self.refresh_interval_ms / 1000.0
+                        io_rate = (delta_read + delta_write) / 1024.0 / interval_s  # KB/s
+                    self.prev_disk_io = io
+                else:
+                    io_rate = 0.0
+
+                disk_usage_pct = (disk.used / disk.total) * 100.0
+
+                def color_for(val_pct):
+                    if val_pct < 25:
+                        return "green"
+                    elif val_pct < 50:
+                        return "yellow"
+                    elif val_pct < 80:
+                        return "orange"
+                    else:
+                        return "red"
+
+                cpu_color = color_for(cpu)
+                ram_color = color_for(mem.percent)
+
+                max_io_kb = 100 * 1024  # assume 100 MB/s ceiling
+                io_pct = min((io_rate / max_io_kb) * 100.0, 100.0)
+                io_color = color_for(io_pct)
+
+                disk_color = color_for(disk_usage_pct)
+
+                html = (
+                    f"OS: {platform.system()} {platform.release()} | "
+                    f"CPU {cpu:.1f}% | "
+                    f"RAM {mem.percent:.1f}% | "
+                    f"Disk I/O {io_rate:.1f} KB/s | "
+                    f"Disk (C:) {bytes_to_gb(disk.used)}GB/{bytes_to_gb(disk.total)}GB "
+                    f"({disk_usage_pct:.1f}%)"
+                )
+                self.sys_info_label.setText(html)
+            except Exception:
+                self.sys_info_label.setText("System info: unavailable")
+
+            # --- Process Table (dashboard) ---
+            proc_map, results = self._gather_proc_scores()
+            results_sorted = sorted(results, key=lambda x: x[8], reverse=True)
+            self.proc_map = proc_map
+            top_dashboard = results_sorted[:15]
+            self._populate_table(self.table_dashboard, top_dashboard)
+
+            # --- Top Culprit label ---
+            if results_sorted:
+                top = results_sorted[0]
+                try:
+                    self.label_culprit.setText(
+                        f"Top Culprit: {top[1]} (PID {top[0]}) Score {top[8]:.1f}"
+                    )
+                except Exception:
+                    self.label_culprit.setText(f"Top Culprit: {top[1]} (PID {top[0]})")
+            else:
+                self.label_culprit.setText("Top Culprit: (none)")
+
+            # --- Top Performance Tab ---
+            try:
+                self._populate_top_performance(results_sorted)
+            except Exception:
+                pass
+
+        except Exception as e:
+            QMessageBox.warning(self, "Dashboard Refresh Failed", str(e))
+
+    def _populate_top_performance(self, results_sorted):
+        if not hasattr(self, 'top_perf_table'):
+            return
+
+        # Collect rows: top 5 of CPU, RAM, Disk, Network
+        rows = []
+        top_cpu = sorted(results_sorted, key=lambda x: x[2], reverse=True)[:5]
+        top_mem = sorted(results_sorted, key=lambda x: x[3], reverse=True)[:5]
+        top_io = sorted(results_sorted, key=lambda x: x[9], reverse=True)[:5]
+        top_net = sorted(results_sorted, key=lambda x: x[10], reverse=True)[:5]
+
+        for p in top_cpu:
+            rows.append(("CPU", p))
+        for p in top_mem:
+            rows.append(("RAM", p))
+        for p in top_io:
+            rows.append(("Disk I/O", p))
+        for p in top_net:
+            rows.append(("Network", p))
+
+        # Reset table
+        self.top_perf_table.setRowCount(0)
+        partition_points = {5, 10, 15}  # after these many data rows insert separator
+
+        data_index = 0
+        insert_row_idx = 0
+        for metric, p in rows:
+            # Insert normal data row
+            self.top_perf_table.insertRow(insert_row_idx)
+            pid = p[0]
+            name = p[1]
+            cpu = p[2]
+            mem = p[3]
+            disk_kb = p[4]
+            net_ops = p[5]
+            score_str = p[6]
+            color = self.get_score_color(score_str)
+
+            values = [metric, pid, name, f"{cpu:.1f}", f"{mem:.1f}", disk_kb, net_ops, score_str]
+            for col, v in enumerate(values):
+                item = QTableWidgetItem(str(v))
+                item.setBackground(color)
+                item.setForeground(QColor("#fff"))
+                self.top_perf_table.setItem(insert_row_idx, col, item)
+
+            insert_row_idx += 1
+            data_index += 1
+
+            # Insert black separator row if data_index in partition_points
+            if data_index in partition_points:
+                self.top_perf_table.insertRow(insert_row_idx)
+                sep_item = QTableWidgetItem("")
+                sep_item.setBackground(QColor("#000000"))
+                self.top_perf_table.setItem(insert_row_idx, 0, sep_item)
+                self.top_perf_table.setSpan(insert_row_idx, 0, 1, self.top_perf_table.columnCount())
+                self.top_perf_table.setRowHeight(insert_row_idx, 6)
+                insert_row_idx += 1
+
+        # --- Force no scroll bars at all ---
+        self.top_perf_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.top_perf_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # Adjust height dynamically so all rows are visible
+        row_count = self.top_perf_table.rowCount()
+        base_row_height = 28
+        header_height = self.top_perf_table.horizontalHeader().height()
+
+        # Compute full table height (always enough for all rows)
+        table_height = (row_count * base_row_height) + header_height + 2
+        self.top_perf_table.setFixedHeight(table_height)
+
+        # Optionally also fix width to prevent horizontal scrollbar
+        total_col_width = sum(self.top_perf_table.columnWidth(c) for c in range(self.top_perf_table.columnCount()))
+        self.top_perf_table.setFixedWidth(total_col_width + self.top_perf_table.verticalHeader().width() + 2)
+
+    # -----------------------
+    # Services tab update
+    # -----------------------
+
+    def _update_services_tab(self):
+        try:
+            services = []
+            for svc in psutil.win_service_iter():
+                try:
+                    info = svc.as_dict()
+                    name = info.get("display_name") or info.get("name") or ""
+                    status = info.get("status", "")
+                    pid = info.get("pid") or "-"
+                    cpu = 0.0
+                    mem = 0.0
+                    if isinstance(pid, int) and pid > 0:
+                        try:
+                            p = psutil.Process(pid)
+                            cpu = p.cpu_percent(interval=0.0)
+                            mem = p.memory_percent()
+                        except Exception:
+                            pass
+                    services.append((name, status, pid, cpu, mem))
+                except Exception:
+                    continue
+
+            # ✅ Sort by memory usage (highest first)
+            services.sort(key=lambda x: x[4], reverse=True)
+
+            self.table_services.setRowCount(len(services))
+            for r, (name, status, pid, cpu, mem) in enumerate(services):
+                bg = QColor("#222") if r % 2 == 0 else QColor("#111")
+                items = [
+                    QTableWidgetItem(str(name)),
+                    QTableWidgetItem(str(status)),
+                    QTableWidgetItem(str(pid)),
+                    QTableWidgetItem(f"{cpu:.1f}"),
+                    QTableWidgetItem(f"{mem:.1f}"),
+                ]
+                for c, it in enumerate(items):
+                    it.setBackground(bg)
+                    it.setForeground(QColor("#0f0"))
+                    self.table_services.setItem(r, c, it)
+
+                # Context menu with Stop / Disable / Kill
+                menu = QMenu()
+                stop_action = QAction("Stop", self)
+                disable_action = QAction("Disable", self)
+                kill_action = QAction("Kill", self)
+                svc_name_local = name
+                stop_action.triggered.connect(lambda _, n=svc_name_local: subprocess.run(["sc", "stop", n], capture_output=True))
+                disable_action.triggered.connect(lambda _, n=svc_name_local: subprocess.run(["sc", "config", n, "start=", "disabled"], capture_output=True))
+                kill_action.triggered.connect(lambda _, p=pid: (psutil.Process(p).kill() if isinstance(p, int) and p > 0 else None))
+                menu.addAction(stop_action)
+                menu.addAction(disable_action)
+                menu.addAction(kill_action)
+
+                btn = QToolButton()
+                btn.setText("Manage")
+                btn.setMenu(menu)
+                btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+                self.table_services.setCellWidget(r, 5, btn)
+
+        except Exception:
+            pass
+
+    # -----------------------
+    # Context menu and actions
+    # -----------------------
+
+    def _proc_table_show_info(self, row, column):
+        try:
+            pid_item = self.table_dashboard.item(row, 0)
+            path_item = self.table_dashboard.item(row, 7)
+            if not pid_item:
+                return
+            pid = pid_item.text()
+            file_path = path_item.text() if path_item else ""
+            if file_path:
+                self.label_culprit.setText(f"PID {pid} → {file_path}")
+            else:
+                self.label_culprit.setText(f"PID {pid} → [No Path Detected]")
+        except Exception:
+            pass
+
+    def _open_file_location(self, file_path: str):
+        if file_path and os.path.exists(file_path):
+            try:
+                subprocess.Popen(["explorer", "/select,", file_path])
+            except Exception:
+                try:
+                    subprocess.Popen(f'explorer /select,"{file_path}"')
+                except Exception:
+                    pass
+
+    def _kill_process(self, pid):
+        try:
+            proc = psutil.Process(pid)
+            proc.kill()
+            self.label_culprit.setText(f"Process killed: PID {pid}")
+        except Exception as e:
+            QMessageBox.warning(self, "Kill Failed", str(e))
+
+    def _delete_file(self, path):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                return True, f"Deleted: {path}"
+            return False, "File not found"
+        except Exception as e:
+            return False, str(e)
+
+    def _deep_delete(self, pid, path):
+        try:
+            if pid:
+                try:
+                    p = psutil.Process(pid)
+                    p.kill()
+                except Exception:
+                    pass
+
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+            # best-effort registry cleanup
+            reg_paths = [
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+            ]
+            for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for pth in reg_paths:
+                    try:
+                        with winreg.OpenKey(root, pth, 0, winreg.KEY_ALL_ACCESS) as key:
+                            i = 0
+                            while True:
+                                try:
+                                    name, val, _ = winreg.EnumValue(key, i)
+                                    if path and path.lower() in str(val).lower():
+                                        winreg.DeleteValue(key, name)
+                                    else:
+                                        i += 1
+                                except OSError:
+                                    break
+                    except Exception:
+                        continue
+
+            return True, "Deep delete attempted"
+        except Exception as e:
+            return False, str(e)
+
+    def _show_proc_context_menu(self, pos):
+        row = self.table_dashboard.currentRow()
+        if row < 0:
+            return
+        pid_item = self.table_dashboard.item(row, 0)
+        path_item = self.table_dashboard.item(row, 7)
+        if not pid_item:
+            return
+        try:
+            pid = int(pid_item.text())
+        except Exception:
+            pid = None
+        exe_path = path_item.text().strip() if path_item else ""
+
+        menu = QMenu(self)
+        act_kill = menu.addAction("Kill Process")
+        act_open_loc = menu.addAction("Open File Location")
+        act_info = menu.addAction("Info Path")
+        act_delete = menu.addAction("Delete File")
+        act_deep_delete = menu.addAction("Deep Delete (Kill + Delete + Registry)")
+        action = menu.exec(self.table_dashboard.viewport().mapToGlobal(pos))
+
+        if action == act_kill:
+            if pid is not None:
+                self._kill_process(pid)
+        elif action == act_open_loc:
+            if exe_path:
+                if os.path.exists(exe_path):
+                    try:
+                        self._open_file_location(exe_path)
+                    except Exception as e:
+                        QMessageBox.warning(self, "Error", f"Open location failed:\n{e}")
+                else:
+                    QMessageBox.warning(self, "Error", "Executable path not found.")
+            else:
+                QMessageBox.warning(self, "Error", "Executable path not available.")
+        elif action == act_info:
+            if exe_path:
+                QMessageBox.information(self, "File Path", exe_path)
+            else:
+                QMessageBox.warning(self, "Error", "Executable path not available.")
+        elif action == act_delete:
+            if exe_path and os.path.exists(exe_path):
+                ok, msg = self._delete_file(exe_path)
+                if ok:
+                    QMessageBox.information(self, "Deleted", msg)
+                else:
+                    QMessageBox.warning(self, "Delete Failed", msg)
+            else:
+                QMessageBox.warning(self, "Error", "File not found for deletion.")
+        elif action == act_deep_delete:
+            ok, msg = self._deep_delete(pid, exe_path)
+            if ok:
+                QMessageBox.information(self, "Deep Delete", msg)
+            else:
+                QMessageBox.warning(self, "Deep Delete Failed", msg)
+
+    # -----------------------
+    # Export and utilities
+    # -----------------------
+
+    def _export_report(self):
+        try:
+            with open(REPORT_FILE, "a", encoding="utf-8") as f:
+                f.write(f"\n--- Report {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+                f.write("PID | Name | CPU% | MEM% | Disk_R/W_KB | NetOps | Score | Path\n")
+                for r in range(self.table_dashboard.rowCount()):
+                    vals = []
+                    for c in range(self.table_dashboard.columnCount()):
+                        it = self.table_dashboard.item(r, c)
+                        vals.append(it.text() if it else "")
+                    f.write(" | ".join(vals) + "\n")
+            QMessageBox.information(self, "Export", f"Report appended to {REPORT_FILE}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", str(e))
+
+    def _kill_selected_process(self):
+        row = self.table_dashboard.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Kill Process", "Select a process row in the Dashboard table first.")
+            return
+        pid_item = self.table_dashboard.item(row, 0)
+        if not pid_item:
+            QMessageBox.warning(self, "Kill Process", "Unable to read PID from selected row.")
+            return
+        try:
+            pid = int(pid_item.text())
+        except Exception:
+            QMessageBox.warning(self, "Kill Process", "Invalid PID.")
+            return
+        confirm = QMessageBox.question(self, "Confirm Kill", f"Terminate process PID {pid}?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            p = psutil.Process(pid)
+            p.terminate()
+            p.wait(timeout=3)
+            QMessageBox.information(self, "Process Terminated", f"Process {pid} terminated.")
+        except psutil.NoSuchProcess:
+            QMessageBox.information(self, "Process Gone", "Process no longer exists.")
+        except Exception as e:
+            QMessageBox.critical(self, "Kill Failed", str(e))
+
+    # -----------------------
+    # Suggestions tab actions
+    # -----------------------
+
+    def _refresh_suggestions(self):
+        proc_map = self.proc_map or {}
+        suggestions = self.sugg.scan_for_suggestions(proc_map)
+        self.table_suggestions.setRowCount(0)
+        for r, s in enumerate(suggestions):
+            name, typ, usage, suggestion_text, action_callable = s
+            self.table_suggestions.insertRow(r)
+            self.table_suggestions.setItem(r, 0, QTableWidgetItem(str(name)))
+            self.table_suggestions.setItem(r, 1, QTableWidgetItem(str(typ)))
+            self.table_suggestions.setItem(r, 2, QTableWidgetItem(str(usage)))
+            self.table_suggestions.setItem(r, 3, QTableWidgetItem(str(suggestion_text)))
+            btn = QPushButton("Execute")
+            if not callable(action_callable):
+                btn.setText("No Action")
+                btn.setEnabled(False)
+            else:
+                btn.clicked.connect(partial(self._execute_suggestion_action, action_callable, name))
+            self.table_suggestions.setCellWidget(r, 4, btn)
+        self.suggestions_status.append(f"[{datetime.now().strftime('%H:%M:%S')}] Suggestions refreshed ({len(suggestions)} items).")
+
+    def _execute_suggestion_action(self, action_callable, display_name):
+        try:
+            res = action_callable()
+            if isinstance(res, tuple) and len(res) == 2:
+                ok, msg = res
+                if ok:
+                    self.suggestions_status.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ {display_name}: {msg}")
+                    QMessageBox.information(self, "Action Result", msg)
+                else:
+                    self.suggestions_status.append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ {display_name}: {msg}")
+                    QMessageBox.warning(self, "Action Failed", msg)
+            else:
+                self.suggestions_status.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ {display_name}: action executed.")
+                QMessageBox.information(self, "Action", f"Action executed for {display_name}.")
+        except Exception as e:
+            self.suggestions_status.append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ {display_name}: Exception {e}")
+            QMessageBox.critical(self, "Action Exception", str(e))
+
+    # -----------------------
+    # Helpers
+    # -----------------------
+
+    def _on_refresh_change(self, val):
+        self.refresh_interval_ms = val * 1000
+        self.timer.setInterval(self.refresh_interval_ms)
+
+
+# -----------------------
+# Entrypoint
+# -----------------------
+
+def main():
+    app = QApplication(sys.argv)
+    win = PerformanceMonitorGUI()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
