@@ -322,6 +322,7 @@ class SuggestionEngine:
 # -----------------------
 # Main GUI
 # -----------------------
+from ai_suggestion_engine import AISuggestionsEngine
 class PerformanceMonitorGUI(QWidget):
     def __init__(self):
         super().__init__()
@@ -334,6 +335,7 @@ class PerformanceMonitorGUI(QWidget):
         self.prev_disk_io = None
         self.proc_map = {}
         self.sugg = SuggestionEngine()
+        self.sugg_ai = AISuggestionsEngine()
 
         # ---------- AI Engine placeholder (will be instantiated on demand) ----------
         self.ai_engine = None
@@ -1100,94 +1102,101 @@ class PerformanceMonitorGUI(QWidget):
     # ---------------------------
     # AI Suggestions button click handler
     # ---------------------------
+    def _populate_suggestions_table(self, suggestions):
+        self.table_suggestions.setRowCount(0)  # clear first
+
+        for row, s in enumerate(suggestions):
+            self.table_suggestions.insertRow(row)
+
+            # Column 0: Name
+            self.table_suggestions.setItem(row, 0, QTableWidgetItem(s.get("name", "")))
+
+            # Column 1: Type
+            self.table_suggestions.setItem(row, 1, QTableWidgetItem(s.get("type", "")))
+
+            # Column 2: Usage / details
+            self.table_suggestions.setItem(row, 2, QTableWidgetItem(s.get("description", "")))
+
+            # Column 3: Suggestion text
+            self.table_suggestions.setItem(row, 3, QTableWidgetItem(s.get("suggestion", "")))
+
+            # Column 4: Action button
+            btn = QPushButton("Execute")
+            if callable(s.get("action_callable")):
+                btn.clicked.connect(partial(self._execute_suggestion_action, s.get("action_callable"), s.get("name")))
+            else:
+                btn.setText("No Action")
+                btn.setEnabled(False)
+            self.table_suggestions.setCellWidget(row, 4, btn)
+
+            # Column 5: Score / Priority
+            score = s.get("score", 0)
+            priority = s.get("priority", "")
+            self.table_suggestions.setItem(row, 5, QTableWidgetItem(f"{score} {priority}"))
+
+        self.table_suggestions.resizeColumnsToContents()
+
+
+    from functools import partial
+    from PyQt6.QtWidgets import QTableWidgetItem, QPushButton
+    from PyQt6.QtCore import QTimer
+    from datetime import datetime
+
     def _on_ai_suggestions_clicked(self):
-        """
-        Runs AI suggestion checks and populates the suggestions table.
-        Compatible with _refresh_suggestions / Execute buttons.
-        """
-        try:
-            self.suggestions_status.append("Running AI Suggestions scan...")
-            self.btn_ai_suggestions.setEnabled(False)
-        except Exception:
-            pass
+        self.btn_ai_suggestions.setEnabled(False)
 
         def worker():
-            from ai_suggestion_engine import AISuggestionsEngine
             results = []
-
             try:
-                engine = AISuggestionsEngine()
-                results = engine.run_all_checks() or []
+                # Run your AI engine
+                results = self.sugg_ai.run_all_checks()
+                print(f"[AI] Full scan completed: {len(results)} suggestions")
             except Exception as e:
-                print("[AI] Engine error:", e)
+                print(f"[AI] Engine failed: {e}")
                 results = []
 
-            # fallback sample
-            if not results:
-                results = [
-                    {
-                        "name": "chrome.exe",
-                        "type": "Process",
-                        "description": "CPU 75%",
-                        "score": 40,
-                        "suggestion": "Restart browser to free memory",
-                        "priority": "🟡 Moderate",
-                    },
-                    {
-                        "name": "temp.exe",
-                        "type": "Unsigned EXE",
-                        "description": "Running from Temp folder",
-                        "score": 90,
-                        "suggestion": "Quarantine file immediately",
-                        "priority": "🔴 Critical",
-                    },
-                ]
-
-            # --- Convert AI dict results into tuples for _refresh_suggestions ---
+            # Convert to include action_callable for buttons
             suggestions = []
             for r in results:
-                name = r.get("name", "")
-                typ = r.get("type", "")
-                usage = r.get("description", "")
-                suggestion_text = r.get("suggestion", "")
-                # Action callable can be a stub for now
-                action_callable = lambda n=name: print(f"Execute action for {n}")
-                suggestions.append((name, typ, usage, suggestion_text, action_callable))
+                suggestions.append({
+                    "name": r.get("name", ""),
+                    "type": r.get("type", ""),
+                    "description": r.get("description", ""),
+                    "suggestion": r.get("suggestion", ""),
+                    "score": r.get("score", 0),
+                    "priority": r.get("priority", ""),
+                    "action_callable": lambda n=r.get("name"): print(f"Action executed for {n}")
+                })
 
-            # Update UI safely in main thread
-            from PyQt6.QtCore import QTimer
-
+            # Update UI on main thread
             def update_ui():
-                try:
-                    self.table_suggestions.setRowCount(0)
-                    for r_idx, s in enumerate(suggestions):
-                        name, typ, usage, suggestion_text, action_callable = s
-                        self.table_suggestions.insertRow(r_idx)
-                        self.table_suggestions.setItem(r_idx, 0, QTableWidgetItem(str(name)))
-                        self.table_suggestions.setItem(r_idx, 1, QTableWidgetItem(str(typ)))
-                        self.table_suggestions.setItem(r_idx, 2, QTableWidgetItem(str(usage)))
-                        self.table_suggestions.setItem(r_idx, 3, QTableWidgetItem(str(suggestion_text)))
-                        btn = QPushButton("Execute")
-                        if not callable(action_callable):
-                            btn.setText("No Action")
-                            btn.setEnabled(False)
-                        else:
-                            btn.clicked.connect(partial(self._execute_suggestion_action, action_callable, name))
-                        self.table_suggestions.setCellWidget(r_idx, 4, btn)
-                    self.suggestions_status.append(
-                        f"[{datetime.now().strftime('%H:%M:%S')}] ✅ AI Suggestions completed ({len(suggestions)} results)"
-                    )
-                    self.btn_ai_suggestions.setEnabled(True)
-                except Exception as e:
-                    from PyQt6.QtWidgets import QMessageBox
-                    QMessageBox.warning(self, "AI Suggestions", f"UI update failed: {e}")
-                    self.btn_ai_suggestions.setEnabled(True)
+                self.table_suggestions.setRowCount(0)
+                for row, s in enumerate(suggestions):
+                    self.table_suggestions.insertRow(row)
+                    self.table_suggestions.setItem(row, 0, QTableWidgetItem(s["name"]))
+                    self.table_suggestions.setItem(row, 1, QTableWidgetItem(s["type"]))
+                    self.table_suggestions.setItem(row, 2, QTableWidgetItem(s["description"]))
+                    self.table_suggestions.setItem(row, 3, QTableWidgetItem(s["suggestion"]))
+
+                    # Action button
+                    btn = QPushButton("Execute")
+                    if callable(s["action_callable"]):
+                        btn.clicked.connect(partial(self._execute_suggestion_action, s["action_callable"], s["name"]))
+                    else:
+                        btn.setEnabled(False)
+                    self.table_suggestions.setCellWidget(row, 4, btn)
+
+                    # Score + Priority
+                    self.table_suggestions.setItem(row, 5, QTableWidgetItem(f"{s['score']} {s['priority']}"))
+
+                self.table_suggestions.resizeColumnsToContents()
+                self.suggestions_status.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ AI Suggestions completed ({len(suggestions)} results)")
+                self.btn_ai_suggestions.setEnabled(True)
 
             QTimer.singleShot(0, update_ui)
 
         import threading
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+        threading.Thread(target=worker, daemon=True).start()
 
 # Bind methods into PerformanceMonitorGUI class
 #setattr(PerformanceMonitorGUI, "_on_ai_suggestions_clicked", _on_ai_suggestions_clicked)
