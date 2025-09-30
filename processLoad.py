@@ -1,7 +1,4 @@
 # processLoad_merged_part1.py
-# Merged version (Part 1 of 2) — original file + AI Suggestions integration
-# Keep both parts in the same .py file (Part1 then Part2).
-
 # ---------------------------
 # Imports (original + additions)
 # ---------------------------
@@ -1100,97 +1097,101 @@ class PerformanceMonitorGUI(QWidget):
             self.suggestions_status.append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ {display_name}: Exception {e}")
             QMessageBox.critical(self, "Action Exception", str(e))
 
-def _on_ai_suggestions_clicked(self):
-    """
-    Runs AI suggestion checks and populates the suggestions table.
-    This version ensures the UI always updates, even if the engine is empty or fails.
-    """
-    try:
-        self.suggestions_status.append("Running AI Suggestions scan...")
-        self.btn_ai_suggestions.setEnabled(False)
-    except Exception:
-        pass
-
-    def worker():
-        from ai_suggestion_engine import AISuggestionsEngine
-        results = []
-
+    # ---------------------------
+    # AI Suggestions button click handler
+    # ---------------------------
+    def _on_ai_suggestions_clicked(self):
+        """
+        Runs AI suggestion checks and populates the suggestions table.
+        Compatible with _refresh_suggestions / Execute buttons.
+        """
         try:
-            engine = AISuggestionsEngine()
-            results = engine.run_all_checks() or []
-        except Exception as e:
-            print("[AI] Engine error:", e)
+            self.suggestions_status.append("Running AI Suggestions scan...")
+            self.btn_ai_suggestions.setEnabled(False)
+        except Exception:
+            pass
+
+        def worker():
+            from ai_suggestion_engine import AISuggestionsEngine
             results = []
 
-        # --- DEBUG FALLBACK: inject sample rows if nothing returned ---
-        if not results:
-            results = [
-                {
-                    "name": "chrome.exe",
-                    "type": "Process",
-                    "description": "CPU 75%",
-                    "score": 40,
-                    "suggestion": "Restart browser to free memory",
-                    "priority": "🟡 Moderate",
-                },
-                {
-                    "name": "temp.exe",
-                    "type": "Unsigned EXE",
-                    "description": "Running from Temp folder",
-                    "score": 90,
-                    "suggestion": "Quarantine file immediately",
-                    "priority": "🔴 Critical",
-                },
-            ]
-
-        # --- Prepare table rows (5 columns expected) ---
-        rows = []
-        for item in results:
-            rows.append([
-                item.get("name", ""),
-                item.get("type", ""),
-                item.get("description", ""),
-                f"{item.get('score', '')} {item.get('priority', '')}",
-                item.get("suggestion", "")
-            ])
-
-        def update_ui():
             try:
-                self.table_suggestions.show()
-                rows = self._ai_results_to_rows(results)  # convert dicts → rows
-                self._populate_table(self.table_suggestions, rows)
-                self.suggestions_status.append(
-                    f"✅ AI Suggestions completed ({len(rows)} results)"
-                )
-                self.btn_ai_suggestions.setEnabled(True)
+                engine = AISuggestionsEngine()
+                results = engine.run_all_checks() or []
             except Exception as e:
-                QMessageBox.warning(self, "AI Suggestions", f"UI update failed: {e}")
-                self.btn_ai_suggestions.setEnabled(True)
+                print("[AI] Engine error:", e)
+                results = []
 
+            # fallback sample
+            if not results:
+                results = [
+                    {
+                        "name": "chrome.exe",
+                        "type": "Process",
+                        "description": "CPU 75%",
+                        "score": 40,
+                        "suggestion": "Restart browser to free memory",
+                        "priority": "🟡 Moderate",
+                    },
+                    {
+                        "name": "temp.exe",
+                        "type": "Unsigned EXE",
+                        "description": "Running from Temp folder",
+                        "score": 90,
+                        "suggestion": "Quarantine file immediately",
+                        "priority": "🔴 Critical",
+                    },
+                ]
 
-        # Push UI update safely back to Qt main thread
-        QTimer.singleShot(0, update_ui)
+            # --- Convert AI dict results into tuples for _refresh_suggestions ---
+            suggestions = []
+            for r in results:
+                name = r.get("name", "")
+                typ = r.get("type", "")
+                usage = r.get("description", "")
+                suggestion_text = r.get("suggestion", "")
+                # Action callable can be a stub for now
+                action_callable = lambda n=name: print(f"Execute action for {n}")
+                suggestions.append((name, typ, usage, suggestion_text, action_callable))
 
-    # Run in background thread
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+            # Update UI safely in main thread
+            from PyQt6.QtCore import QTimer
 
-def _populate_table_from_ai(self, suggestions):
-    # Utility if needed elsewhere — converts engine results to table rows and populates
-    rows = []
-    for r in suggestions:
-        name = r.get("name", "")
-        typ = r.get("type", "")
-        usage = r.get("description", "")
-        suggestion_text = r.get("suggestion", "")
-        action_label = r.get("priority", "")
-        rows.append((name, typ, usage, suggestion_text, action_label))
-    self._populate_table(self.table_suggestions, rows)
+            def update_ui():
+                try:
+                    self.table_suggestions.setRowCount(0)
+                    for r_idx, s in enumerate(suggestions):
+                        name, typ, usage, suggestion_text, action_callable = s
+                        self.table_suggestions.insertRow(r_idx)
+                        self.table_suggestions.setItem(r_idx, 0, QTableWidgetItem(str(name)))
+                        self.table_suggestions.setItem(r_idx, 1, QTableWidgetItem(str(typ)))
+                        self.table_suggestions.setItem(r_idx, 2, QTableWidgetItem(str(usage)))
+                        self.table_suggestions.setItem(r_idx, 3, QTableWidgetItem(str(suggestion_text)))
+                        btn = QPushButton("Execute")
+                        if not callable(action_callable):
+                            btn.setText("No Action")
+                            btn.setEnabled(False)
+                        else:
+                            btn.clicked.connect(partial(self._execute_suggestion_action, action_callable, name))
+                        self.table_suggestions.setCellWidget(r_idx, 4, btn)
+                    self.suggestions_status.append(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] ✅ AI Suggestions completed ({len(suggestions)} results)"
+                    )
+                    self.btn_ai_suggestions.setEnabled(True)
+                except Exception as e:
+                    from PyQt6.QtWidgets import QMessageBox
+                    QMessageBox.warning(self, "AI Suggestions", f"UI update failed: {e}")
+                    self.btn_ai_suggestions.setEnabled(True)
+
+            QTimer.singleShot(0, update_ui)
+
+        import threading
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
 
 # Bind methods into PerformanceMonitorGUI class
-setattr(PerformanceMonitorGUI, "_on_ai_suggestions_clicked", _on_ai_suggestions_clicked)
-setattr(PerformanceMonitorGUI, "_populate_table_from_ai", _populate_table_from_ai)
-
+#setattr(PerformanceMonitorGUI, "_on_ai_suggestions_clicked", _on_ai_suggestions_clicked)
+#setattr(PerformanceMonitorGUI, "_ai_results_to_rows", _ai_results_to_rows)
 # -----------------------
 # Application entrypoint
 # -----------------------
