@@ -1117,12 +1117,7 @@ class PerformanceMonitorGUI(QWidget):
         Runs AI suggestion checks and populates the suggestions table.
         Compatible with _refresh_suggestions / Execute buttons.
         """
-        try:
-            suggestions = self.sugg.run_all_checks()  # Assuming 'sugg' is an instance of AISuggestionsEngine
-            self._populate_suggestions_table(suggestions)
-        except Exception as e:
-            print(f"Error fetching AI suggestions: {e}")
-
+        
         def worker():
             from ai_suggestion_engine import AISuggestionsEngine
             results = []
@@ -1166,36 +1161,46 @@ class PerformanceMonitorGUI(QWidget):
                 action_callable = lambda n=name: print(f"Execute action for {n}")
                 suggestions.append((name, typ, usage, suggestion_text, action_callable))
 
-            # Update UI safely in main thread
             from PyQt6.QtCore import QTimer
-
-            def update_ui():
-                try:
-                    self.table_suggestions.setRowCount(0)
-                    for r_idx, s in enumerate(suggestions):
-                        name, typ, usage, suggestion_text, action_callable = s
-                        self.table_suggestions.insertRow(r_idx)
-                        self.table_suggestions.setItem(r_idx, 0, QTableWidgetItem(str(name)))
-                        self.table_suggestions.setItem(r_idx, 1, QTableWidgetItem(str(typ)))
-                        self.table_suggestions.setItem(r_idx, 2, QTableWidgetItem(str(usage)))
-                        self.table_suggestions.setItem(r_idx, 3, QTableWidgetItem(str(suggestion_text)))
-                        btn = QPushButton("Execute")
-                        if not callable(action_callable):
-                            btn.setText("No Action")
-                            btn.setEnabled(False)
-                        else:
-                            btn.clicked.connect(partial(self._execute_suggestion_action, action_callable, name))
-                        self.table_suggestions.setCellWidget(r_idx, 4, btn)
-                    self.suggestions_status.append(
-                        f"[{datetime.now().strftime('%H:%M:%S')}] ✅ AI Suggestions completed ({len(suggestions)} results)"
-                    )
-                    self.btn_ai_suggestions.setEnabled(True)
-                except Exception as e:
-                    from PyQt6.QtWidgets import QMessageBox
-                    QMessageBox.warning(self, "AI Suggestions", f"UI update failed: {e}")
-                    self.btn_ai_suggestions.setEnabled(True)
-
             QTimer.singleShot(0, update_ui)
+
+        def update_ui():
+            try:
+                self.table_suggestions.setRowCount(0)
+                for r_idx, s in enumerate(suggestions):
+                    name, typ, usage, suggestion_text, action_callable = s
+                    self.table_suggestions.insertRow(r_idx)
+                    self.table_suggestions.setItem(r_idx, 0, QTableWidgetItem(str(name)))
+                    self.table_suggestions.setItem(r_idx, 1, QTableWidgetItem(str(typ)))
+                    self.table_suggestions.setItem(r_idx, 2, QTableWidgetItem(str(usage)))
+                    self.table_suggestions.setItem(r_idx, 3, QTableWidgetItem(str(suggestion_text)))
+                    btn = QPushButton("Execute")
+                    if not callable(action_callable):
+                        btn.setText("No Action")
+                        btn.setEnabled(False)
+                    else:
+                        btn.clicked.connect(partial(self._execute_suggestion_action, action_callable, name))
+                    self.table_suggestions.setCellWidget(r_idx, 4, btn)
+
+                total_suggestions = self.table_suggestions.rowCount()
+
+                # ✅ Show AI completion message in same log widget
+                self.suggestions_status.append(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] [AI] Full AI scan completed: {total_suggestions} total suggestions."
+                )
+
+                # ✅ Keep your existing completion line
+                self.suggestions_status.append(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] ✅ AI Suggestions completed ({len(suggestions)} results)"
+                )
+
+                self.btn_ai_suggestions.setEnabled(True)
+
+            except Exception as e:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "AI Suggestions", f"UI update failed: {e}")
+                self.btn_ai_suggestions.setEnabled(True)
+
 
         import threading
         t = threading.Thread(target=worker, daemon=True)
