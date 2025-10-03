@@ -14,6 +14,7 @@ import hashlib
 import threading
 import time
 import ctypes
+import traceback
 from datetime import datetime
 from functools import partial
 from collections import deque, defaultdict
@@ -38,10 +39,17 @@ except Exception:
 APP_TITLE = "Century EVO Performance Monitor"
 REPORT_FILE = "performance_report_gui.txt"
 REFRESH_MS_DEFAULT = 5000  # 5 seconds
+LOG_FILE = "ai_engine.log"
 
 # -----------------------
 # Utility helpers (unchanged)
 # -----------------------
+def safe_log(msg: str):
+    """Log both to console and file."""
+    print(msg)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
 def bytes_to_gb(n):
     try:
         return round(n / (1024 ** 3), 2)
@@ -323,7 +331,7 @@ class SuggestionEngine:
 # -----------------------
 # Main GUI
 # -----------------------
-from ai_suggestion_engine import AISuggestionsEngine
+from ai_suggestion_engine import AISuggestionEngine
 class PerformanceMonitorGUI(QWidget):
     def __init__(self):
         super().__init__()
@@ -336,14 +344,18 @@ class PerformanceMonitorGUI(QWidget):
         self.prev_disk_io = None
         self.proc_map = {}
         self.sugg = SuggestionEngine()
-        self.sugg_ai = AISuggestionsEngine()
+        self.sugg_ai = AISuggestionEngine()
 
         # ---------- AI Engine placeholder (will be instantiated on demand) ----------
-        self.ai_engine = None
+        self.ai_engine = AISuggestionEngine()
         self._ai_thread = None
         self._ai_lock = threading.RLock()
 
         self._build_ui()
+
+        # 💾 Clear previous log on startup
+        open(LOG_FILE, "w").close()
+        self.suggestions_status.append("[Init] AI Engine ready. Logs: ai_engine.log")
 
         # ✅ Apply dark neon stylesheet globally
         self.setStyleSheet(
@@ -1590,116 +1602,159 @@ class PerformanceMonitorGUI(QWidget):
             self.suggestions_status.append(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ {display_name}: Exception {e}")
             QMessageBox.critical(self, "Action Exception", str(e))
 
-    # ---------------------------
-    # AI Suggestions button click handler
-    # ---------------------------
+    # ====================================================
+    # 🧠 AI Suggestions Handler (Level 1 + Level 2 Engine)
+    # ====================================================
+
     def _populate_suggestions_table(self, suggestions):
+        """Populate table with AI suggestion entries."""
         self.table_suggestions.setRowCount(len(suggestions))
         for row, s in enumerate(suggestions):
             self.table_suggestions.setItem(row, 0, QTableWidgetItem(s.get("name", "")))          # Name
             self.table_suggestions.setItem(row, 1, QTableWidgetItem(s.get("type", "")))          # Type
             self.table_suggestions.setItem(row, 2, QTableWidgetItem(s.get("description", "")))   # Usage / details
             self.table_suggestions.setItem(row, 3, QTableWidgetItem(s.get("suggestion", "")))    # Suggestion / action text
-            self.table_suggestions.setItem(row, 4, QTableWidgetItem(f"{s.get('score', 0)} {s.get('priority', '')}"))  # Score + priority
+            self.table_suggestions.setItem(
+                row, 4, QTableWidgetItem(f"{s.get('score', 0)} {s.get('priority', '')}")
+            )  # Score + priority
         self.table_suggestions.resizeColumnsToContents()
 
     def _on_ai_suggestions_clicked(self):
         """
-        Runs AI suggestion checks and populates the suggestions table.
-        Compatible with _refresh_suggestions / Execute buttons.
+        Trigger AI suggestion engine, analyze system & processes,
+        and populate GUI table with structured results.
         """
-        
-        def worker():
-            from ai_suggestion_engine import AISuggestionsEngine
-            results = []
+        try:
+            self.suggestions_status.append("[AI] Starting Level 1 + Level 2 analysis...")
 
-            try:
-                results = self.sugg_ai.run_all_checks()  # use the AI engine
-                self._populate_suggestions_table(results)
-            except Exception as e:
-                print(f"[AI] Engine failed: {e}")
-                results = []
+            # Thread-safe start
+            def run_ai_thread():
+                try:
+                    self.suggestions_status.append("[AI] Thread started safely...")
+                    self.suggestions_status.append("[AI] Collecting process list...")
 
-            # fallback sample
-            if not results:
-                results = [
-                    {
-                        "name": "chrome.exe",
-                        "type": "Process",
-                        "description": "CPU 75%",
-                        "score": 40,
-                        "suggestion": "Restart browser to free memory",
-                        "priority": "🟡 Moderate",
-                    },
-                    {
-                        "name": "temp.exe",
-                        "type": "Unsigned EXE",
-                        "description": "Running from Temp folder",
-                        "score": 90,
-                        "suggestion": "Quarantine file immediately",
-                        "priority": "🔴 Critical",
-                    },
-                ]
+                    # Collect current process list
+                    processes = []
+                    for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "io_counters", "exe"]):
+                        try:
+                            io = proc.info.get("io_counters")
+                            processes.append({
+                                "pid": proc.info.get("pid"),
+                                "name": proc.info.get("name"),
+                                "cpu_percent": proc.info.get("cpu_percent", 0.0),
+                                "memory_percent": proc.info.get("memory_percent", 0.0),
+                                "io_read_bytes": io.read_bytes if io else 0,
+                                "io_write_bytes": io.write_bytes if io else 0,
+                                "exe": proc.info.get("exe", "")
+                            })
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
 
-            # --- Convert AI dict results into tuples for _refresh_suggestions ---
-            suggestions = []
-            for r in results:
-                name = r.get("name", "")
-                typ = r.get("type", "")
-                usage = r.get("description", "")
-                suggestion_text = r.get("suggestion", "")
-                # Action callable can be a stub for now
-                action_callable = lambda n=name: print(f"Execute action for {n}")
-                suggestions.append((name, typ, usage, suggestion_text, action_callable))
+                    self.suggestions_status.append(f"[AI] Found {len(processes)} processes to analyze.")
+                    self.suggestions_status.append("[AI] Running Level 1 system analysis...")
 
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(0, update_ui)
+                    # 🔁 Reset engine context for a fresh scan
+                    self.ai_engine.reset()
+                    self.ai_engine.analyze_system()
 
-        def update_ui():
-            try:
-                self.table_suggestions.setRowCount(0)
-                for r_idx, s in enumerate(suggestions):
-                    name, typ, usage, suggestion_text, action_callable = s
-                    self.table_suggestions.insertRow(r_idx)
-                    self.table_suggestions.setItem(r_idx, 0, QTableWidgetItem(str(name)))
-                    self.table_suggestions.setItem(r_idx, 1, QTableWidgetItem(str(typ)))
-                    self.table_suggestions.setItem(r_idx, 2, QTableWidgetItem(str(usage)))
-                    self.table_suggestions.setItem(r_idx, 3, QTableWidgetItem(str(suggestion_text)))
-                    btn = QPushButton("Execute")
-                    if not callable(action_callable):
-                        btn.setText("No Action")
-                        btn.setEnabled(False)
+                    # 🔍 Analyze each process
+                    for i, proc in enumerate(processes, 1):
+                        self.ai_engine.analyze_process(proc)
+                        if i % 25 == 0:
+                            self.suggestions_status.append(f"[AI] Analyzed {i}/{len(processes)} processes...")
+
+                    self.suggestions_status.append(f"[AI] Process analysis completed ({len(processes)} entries).")
+
+                    # Retrieve AI output
+                    ai_suggestions = self.ai_engine.get_suggestions()
+                    self.suggestions_status.append(f"[AI] Retrieved {len(ai_suggestions)} raw AI suggestions.")
+
+                    # 🧠 Debug sample
+                    if ai_suggestions:
+                        print("[AI] Example suggestion:", ai_suggestions[0])
                     else:
-                        btn.clicked.connect(partial(self._execute_suggestion_action, action_callable, name))
-                    self.table_suggestions.setCellWidget(r_idx, 4, btn)
+                        print("[AI] No suggestions returned.")
 
-                total_suggestions = self.table_suggestions.rowCount()
+                    # ✅ Build safe, normalized suggestion list
+                    results = []
+                    for s in ai_suggestions:
+                        try:
+                            # Case 1: dict-based suggestion
+                            if isinstance(s, dict):
+                                text = s.get("text", str(s))
+                                sev = s.get("severity", "info")
+                                conf = s.get("confidence", 0.5)
 
-                # ✅ Show AI completion message in same log widget
-                self.suggestions_status.append(
-                    f"[{datetime.now().strftime('%H:%M:%S')}] [AI] Full AI scan completed: {total_suggestions} total suggestions."
-                )
+                            # Case 2: tuple/list (name, sev, conf)
+                            elif isinstance(s, (list, tuple)) and len(s) >= 2:
+                                text = str(s[0])
+                                sev = str(s[1]) if len(s) > 1 else "info"
+                                conf = float(s[2]) if len(s) > 2 else 0.5
 
-                # ✅ Keep your existing completion line
-                self.suggestions_status.append(
-                    f"[{datetime.now().strftime('%H:%M:%S')}] ✅ AI Suggestions completed ({len(suggestions)} results)"
-                )
+                            # Case 3: plain string
+                            elif isinstance(s, str):
+                                text = s
+                                sev = "info"
+                                conf = 0.5
 
-                self.btn_ai_suggestions.setEnabled(True)
+                            # Unknown object
+                            else:
+                                text = str(s)
+                                sev = "info"
+                                conf = 0.5
 
-            except Exception as e:
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.warning(self, "AI Suggestions", f"UI update failed: {e}")
-                self.btn_ai_suggestions.setEnabled(True)
+                            # Priority map
+                            priority = {
+                                "warning": "🔴 Critical",
+                                "notice": "🟡 Moderate",
+                                "info": "🟢 Info",
+                            }.get(sev.lower(), "🟢 Info")
 
+                            results.append({
+                                "name": text.split(" ")[0] if text else "Unknown",
+                                "type": sev.capitalize(),
+                                "description": text,
+                                "score": int(conf * 100),
+                                "suggestion": text,
+                                "priority": priority,
+                            })
 
-        import threading
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+                        except Exception as e:
+                            self.suggestions_status.append(f"[AI] Suggestion parse failed: {e}")
+                            continue
 
-# Bind methods into PerformanceMonitorGUI class
-#setattr(PerformanceMonitorGUI, "_on_ai_suggestions_clicked", _on_ai_suggestions_clicked)
-#setattr(PerformanceMonitorGUI, "_ai_results_to_rows", _ai_results_to_rows)
+                    # 🛟 Fallback: empty result
+                    if not results:
+                        self.suggestions_status.append("[AI] No suggestions parsed, fallback triggered.")
+                        results = [{
+                            "name": "system",
+                            "type": "Info",
+                            "description": "AI returned empty list",
+                            "score": 50,
+                            "suggestion": "Check AI engine output",
+                            "priority": "🟢 Info",
+                        }]
+
+                    # 🧱 Update GUI table
+                    self._populate_suggestions_table(results)
+                    self.suggestions_status.append(f"[AI] Table populated with {len(results)} entries.")
+
+                    # ✅ Push summary to GUI log
+                    self.ai_engine.push_to_gui(self)
+
+                except Exception as e:
+                    self.suggestions_status.append(f"[AI][Error] {e}")
+                    import traceback; traceback.print_exc()
+
+            # 🔄 Launch AI in thread
+            import threading
+            t = threading.Thread(target=run_ai_thread, daemon=True)
+            t.start()
+
+        except Exception as e:
+            self.suggestions_status.append(f"[AI][Fatal] {e}")
+            import traceback; traceback.print_exc()
+
 # -----------------------
 # Application entrypoint
 # -----------------------
