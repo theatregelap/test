@@ -21,7 +21,7 @@ from collections import deque, defaultdict
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QTabWidget, QGroupBox, QSpinBox, QMenu, QMessageBox, QTextEdit,
-    QHeaderView, QToolButton , QPlainTextEdit , QSplitter
+    QHeaderView, QToolButton , QPlainTextEdit , QSplitter ,QCheckBox
 )
 from PyQt6.QtGui import QColor, QFont, QAction
 from PyQt6.QtCore import Qt, QTimer
@@ -458,10 +458,24 @@ class PerformanceMonitorGUI(QWidget):
         self.startup_tab = QWidget()
         layout = QVBoxLayout(self.startup_tab)
 
-        # --- Refresh Button ---
+        # --- Top Controls Row ---
+        top_bar = QHBoxLayout()
+
+        # Refresh Button
         btn_refresh = QPushButton("Refresh Startup Entries")
         btn_refresh.clicked.connect(self._update_startup_tab)
-        layout.addWidget(btn_refresh)
+        top_bar.addWidget(btn_refresh)
+
+        # ✅ Checkbox: Show only Enabled
+        self.chk_startup_enabled_only = QCheckBox("Show only Enabled")
+        self.chk_startup_enabled_only.setChecked(False)
+        self.chk_startup_enabled_only.stateChanged.connect(self._update_startup_tab)
+        top_bar.addWidget(self.chk_startup_enabled_only)
+
+        # Spacer to align right (optional aesthetic)
+        top_bar.addStretch(1)
+
+        layout.addLayout(top_bar)
 
         # --- Startup Table ---
         self.table_startup = QTableWidget()
@@ -485,7 +499,9 @@ class PerformanceMonitorGUI(QWidget):
         # Set initial ratio → [3 parts table, 1 part log]
         splitter.setSizes([300, 100])
 
-        layout.addWidget(splitter)        
+        layout.addWidget(splitter)
+
+        # Responsive resize
         self.startup_tab.resizeEvent = lambda event: splitter.setSizes([
             int(self.startup_tab.height() * 0.75),
             int(self.startup_tab.height() * 0.25)
@@ -880,20 +896,19 @@ class PerformanceMonitorGUI(QWidget):
             return False, str(e)
 
     #---------  StartUp  --------------#
-    def _delete_startup_approved_for_views(hive, subkey, name):
-        errs = []
-        views = []
+    # --- Registry Utilities ---
+    def _delete_startup_value_for_views(self, hive, subkey, name):
+        """Delete startup approval value from all registry views (64/32)."""
+        errs, views = [], []
         if hasattr(winreg, "KEY_WOW64_64KEY"):
             views.append(winreg.KEY_WOW64_64KEY)
         if hasattr(winreg, "KEY_WOW64_32KEY"):
             views.append(winreg.KEY_WOW64_32KEY)
         if not views:
             views = [0]
-
         for v in views:
-            access = winreg.KEY_SET_VALUE | v
             try:
-                with winreg.OpenKey(hive, subkey, 0, access) as key:
+                with winreg.OpenKey(hive, subkey, 0, winreg.KEY_SET_VALUE | v) as key:
                     try:
                         winreg.DeleteValue(key, name)
                     except FileNotFoundError:
@@ -904,527 +919,415 @@ class PerformanceMonitorGUI(QWidget):
                 errs.append((v, e))
         return errs
 
-    def _write_startup_approved_for_views(self, hive, subkey, name, data_bytes):
-        """
-        Write name=data_bytes to hive subkey in both 64-bit and 32-bit registry views.
-        Returns list of exceptions (empty list = ok).
-        """
-        errors = []
-        views = []
+    def _write_startup_value_for_views(self, hive, subkey, name, data_bytes):
+        """Write startup approval value to all registry views (64/32)."""
+        errs, views = [], []
         if hasattr(winreg, "KEY_WOW64_64KEY"):
             views.append(winreg.KEY_WOW64_64KEY)
         if hasattr(winreg, "KEY_WOW64_32KEY"):
             views.append(winreg.KEY_WOW64_32KEY)
         if not views:
             views = [0]
-
-        for view in views:
+        for v in views:
             try:
-                with winreg.OpenKey(hive, subkey, 0, winreg.KEY_SET_VALUE | view) as key:
+                with winreg.OpenKey(hive, subkey, 0, winreg.KEY_SET_VALUE | v) as key:
                     winreg.SetValueEx(key, name, 0, winreg.REG_BINARY, data_bytes)
             except FileNotFoundError:
                 continue
             except Exception as e:
-                errors.append(e)
-        return errors
+                errs.append((v, e))
+        return errs
 
-    def _set_startup_approval(self, hive, path, name, action: str):
+    def _get_approval_path(self, path=None, is_folder=False):
+        """
+        Resolve the correct StartupApproved registry path.
+        Handles both 'Run' and 'StartupFolder' entries.
+        """
+        try:
+            if is_folder or not path:
+                return r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
+            if "Run" in path:
+                return path.replace("Run", r"Explorer\\StartupApproved\\Run")
+            return r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\\Run"
+        except Exception as e:
+            self.startup_log_widget.appendPlainText(f"[Startup][Error] _get_approval_path failed: {e}")
+            return r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\\Run"
+
+    def _deduplicate_startup_entries(self, entries):
+        """
+        Deduplicate startup entries with same target exe.
+        Prefer Startup Folder entry if duplicate exists.
+        """
+        deduped = {}
+        for e in entries:
+            target = e.get("target", "").lower()
+            name = e.get("name", "").strip().lower()
+            src = e.get("source", "unknown")
+
+            if not target:
+                target = name  # fallback
+
+            # Normalize path for comparison (handle 8.3 paths)
+            norm_target = target.replace("progra~1", "program files").replace("progra~2", "program files (x86)")
+            key = os.path.basename(norm_target)
+
+            # If duplicate, prefer Startup Folder over Registry
+            if key not in deduped:
+                deduped[key] = e
+            else:
+                if "startup" in src.lower() and "run" in deduped[key]["source"].lower():
+                    deduped[key] = e  # overwrite registry entry
+
+        return list(deduped.values())
+
+    # --- Core Approval ---
+    def _set_startup_approval(self, hive, path, name, action: str, is_folder=False):
         """
         Update StartupApproved registry state for Run or Startup Folder entries.
-        action: "enable", "disable", or "delete"
+        action: enable | disable | delete
         """
         try:
-            if path:  # Registry Run entry
-                approved_path = path.replace("Run", r"Explorer\StartupApproved\Run")
-                if action == "enable":
-                    data = b"\x02" + b"\x00" * 7
-                elif action == "disable":
-                    data = b"\x03" + b"\x00" * 7
-                elif action == "delete":
-                    data = None
+            approved_path = self._get_approval_path(path, is_folder)
 
-                if action in ("enable", "disable"):
-                    errs = self._write_startup_approved_for_views(hive, approved_path, name, data)
-                    if errs:
-                        for e in errs:
-                            self.startup_log_widget.appendPlainText(f"[Startup][Error] {e}")
-                    else:
-                        self.startup_log_widget.appendPlainText(f"[Startup] {action.title()}d {name} in {approved_path}")
-                elif action == "delete":
-                    self._delete_startup_approved_for_views(hive, approved_path, name)
+            if action == "enable":
+                data = b"\x02" + b"\x00" * 7
+            elif action == "disable":
+                data = b"\x03" + b"\x00" * 7
+            else:
+                data = None
 
-            else:  # Startup Folder entry
-                approved_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
-                if action == "enable":
-                    data = b"\x02" + b"\x00" * 7
-                elif action == "disable":
-                    data = b"\x03" + b"\x00" * 7
-                elif action == "delete":
-                    data = None
-
-                if action in ("enable", "disable"):
-                    errs = self._write_startup_approved_for_views(winreg.HKEY_CURRENT_USER, approved_path, name, data)
-                    if errs:
-                        for e in errs:
-                            self.startup_log_widget.appendPlainText(f"[Startup][Error] {e}")
-                    else:
-                        self.startup_log_widget.appendPlainText(f"[Startup] {action.title()}d {name} in Startup Folder approval")
-                elif action == "delete":
-                    self._delete_startup_approved_for_views(winreg.HKEY_CURRENT_USER, approved_path, name)
+            if action in ("enable", "disable"):
+                errs = self._write_startup_value_for_views(hive, approved_path, name, data)
+                for e in errs:
+                    self.startup_log_widget.appendPlainText(f"[Startup][Error] {e}")
+                if not errs:
+                    self.startup_log_widget.appendPlainText(f"[Startup] {action.title()}d {name} in {approved_path}")
+            elif action == "delete":
+                self._delete_startup_value_for_views(hive, approved_path, name)
 
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to {action} startup entry {name}:\n{e}")
-            self.startup_log_widget.appendPlainText(f"[Startup][Error] Failed to {action} {name}: {e}")
+            self.startup_log_widget.appendPlainText(
+                f"[Startup][Error] Approval {action} failed {name}: {e}"
+            )
 
+    # --- Disable Entry ---
     def _disable_startup_entry_ui(self, hive, path, name):
-        """Disable a startup entry (Registry Run or Startup Folder)."""
+        """Disable startup entry (Registry or Folder)."""
         try:
-            if path:  # Registry Run entry
+            if path:
                 try:
                     with winreg.OpenKey(hive, path, 0, winreg.KEY_READ) as key:
-                        value, valtype = winreg.QueryValueEx(key, name)
-                except FileNotFoundError:
-                    value, valtype = None, None
-
-                if value is not None:
+                        val, t = winreg.QueryValueEx(key, name)
                     disabled_path = path.replace("Run", "RunDisabled")
-                    with winreg.CreateKey(hive, disabled_path) as key:
-                        winreg.SetValueEx(key, name, 0, valtype, value)
-                    with winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE) as key:
-                        winreg.DeleteValue(key, name)
-
-                self._set_startup_approval(hive, path, name, "disable")
-
-            else:  # Startup Folder entry
-                startup_paths = [
+                    with winreg.CreateKey(hive, disabled_path) as key2:
+                        winreg.SetValueEx(key2, name, 0, t, val)
+                    with winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE) as key3:
+                        winreg.DeleteValue(key3, name)
+                except FileNotFoundError:
+                    pass
+                self._set_startup_approval(hive, path, name, "disable", False)
+            else:
+                for base in [
                     os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
                     os.path.join(os.environ["ProgramData"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
-                ]
-                for spath in startup_paths:
-                    shortcut = os.path.join(spath, f"{name}.lnk")
-                    if os.path.exists(shortcut):
-                        disabled_shortcut = shortcut + ".disabled"
-                        os.rename(shortcut, disabled_shortcut)
-                        self.startup_log_widget.appendPlainText(f"[Startup] Renamed {shortcut} -> {disabled_shortcut}")
-
-                self._set_startup_approval(hive, path, name, "disable")
-
+                ]:
+                    p = os.path.join(base, f"{name}.lnk")
+                    if os.path.exists(p):
+                        dp = p + ".disabled"
+                        os.rename(p, dp)
+                        self.startup_log_widget.appendPlainText(f"[Startup] Disabled {p} → {dp}")
+                self._set_startup_approval(winreg.HKEY_CURRENT_USER, None, name, "disable", True)
             self._update_startup_tab()
-
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to disable startup entry {name}:\n{e}")
-            self.startup_log_widget.appendPlainText(f"[Startup][Error] Failed to disable {name}: {e}")
+            self.startup_log_widget.appendPlainText(f"[Startup][Error] Disable failed {name}: {e}")
 
+    # --- Enable Entry ---
     def _enable_startup_entry_ui(self, hive, path, name, cmd):
-        """Enable a previously disabled startup entry."""
+        """Enable startup entry (Registry or Folder)."""
         try:
-            if path:  # Registry Run entry
+            if path:
                 disabled_path = path.replace("Run", "RunDisabled")
+                restored = False
                 try:
                     with winreg.OpenKey(hive, disabled_path, 0, winreg.KEY_READ) as key:
-                        value, valtype = winreg.QueryValueEx(key, name)
-                    with winreg.CreateKey(hive, path) as key:
-                        winreg.SetValueEx(key, name, 0, valtype, value)
-                    with winreg.OpenKey(hive, disabled_path, 0, winreg.KEY_SET_VALUE) as key:
-                        winreg.DeleteValue(key, name)
+                        val, t = winreg.QueryValueEx(key, name)
+                    with winreg.CreateKey(hive, path) as key2:
+                        winreg.SetValueEx(key2, name, 0, t, val)
+                    with winreg.OpenKey(hive, disabled_path, 0, winreg.KEY_SET_VALUE) as key3:
+                        winreg.DeleteValue(key3, name)
+                    restored = True
                 except FileNotFoundError:
                     if cmd:
                         with winreg.CreateKey(hive, path) as key:
                             winreg.SetValueEx(key, name, 0, winreg.REG_SZ, cmd)
-
-                self._set_startup_approval(hive, path, name, "enable")
-
-            else:  # Startup Folder entry
-                startup_paths = [
-                    os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
-                    os.path.join(os.environ["ProgramData"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
-                ]
-
+                        restored = True
+                if restored:
+                    self._set_startup_approval(hive, path, name, "enable", False)
+            else:
                 restored = False
-                for spath in startup_paths:
-                    disabled_shortcut = os.path.join(spath, f"{name}.lnk.disabled")
-                    original_shortcut = disabled_shortcut.replace(".disabled", "")
-
-                    if os.path.exists(disabled_shortcut):
-                        # If target .lnk already exists, skip to avoid overwrite
-                        if os.path.exists(original_shortcut):
-                            self.startup_log_widget.appendPlainText(
-                                f"[Startup][Skip] {original_shortcut} already exists, keeping both."
-                            )
-                            continue
-                        try:
-                            os.rename(disabled_shortcut, original_shortcut)
-                            self.startup_log_widget.appendPlainText(
-                                f"[Startup] Restored {disabled_shortcut} -> {original_shortcut}"
-                            )
-                            restored = True
-                        except PermissionError:
-                            try:
-                                shutil.copy2(disabled_shortcut, original_shortcut)
-                                os.remove(disabled_shortcut)
-                                self.startup_log_widget.appendPlainText(
-                                    f"[Startup] Copied {disabled_shortcut} -> {original_shortcut} (fallback)"
-                                )
-                                restored = True
-                            except Exception as e:
-                                self.startup_log_widget.appendPlainText(
-                                    f"[Startup][Error] Fallback copy failed: {e}"
-                                )
-                        except Exception as e:
-                            self.startup_log_widget.appendPlainText(
-                                f"[Startup][Error] Rename failed {disabled_shortcut}: {e}"
-                            )
-
-                if not restored:
-                    self.startup_log_widget.appendPlainText(
-                        f"[Startup][Warn] No disabled shortcut found for {name}"
-                    )
-
-                self._set_startup_approval(hive, path, name, "enable")
-
-            self._update_startup_tab()
-
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to enable startup entry {name}:\n{e}")
-            self.startup_log_widget.appendPlainText(f"[Startup][Error] Failed to enable {name}: {e}")
-
-    def _delete_startup_entry_ui(self, hive, path, name):
-        """Permanently delete a startup entry (registry or folder, including disabled links)."""
-        self._set_startup_approval(hive, path, name, "delete")
-
-        try:
-            if path:  # Registry Run entry
-                try:
-                    with winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE) as key:
-                        try:
-                            winreg.DeleteValue(key, name)
-                            self.startup_log_widget.appendPlainText(f"[Startup] Deleted {name} from {path}")
-                        except FileNotFoundError:
-                            pass
-                except FileNotFoundError:
-                    pass
-
-                # Also delete from RunDisabled if exists
-                disabled_path = path.replace("Run", "RunDisabled")
-                try:
-                    with winreg.OpenKey(hive, disabled_path, 0, winreg.KEY_SET_VALUE) as key:
-                        try:
-                            winreg.DeleteValue(key, name)
-                            self.startup_log_widget.appendPlainText(f"[Startup] Deleted {name} from {disabled_path}")
-                        except FileNotFoundError:
-                            pass
-                except FileNotFoundError:
-                    pass
-
-            else:  # Startup Folder entry
-                startup_paths = [
+                for base in [
                     os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
                     os.path.join(os.environ["ProgramData"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
-                ]
-                for spath in startup_paths:
-                    for ext in [".lnk", ".lnk.disabled"]:
-                        shortcut = os.path.join(spath, f"{name}{ext}")
-                        if os.path.exists(shortcut):
-                            try:
-                                os.remove(shortcut)
-                                self.startup_log_widget.appendPlainText(f"[Startup] Deleted shortcut {shortcut}")
-                            except Exception as e:
-                                QMessageBox.warning(self, "Error", f"Failed to delete shortcut {shortcut}:\n{e}")
-                                self.startup_log_widget.appendPlainText(f"[Startup][Error] Failed to delete shortcut {shortcut}: {e}")
-
+                ]:
+                    dp = os.path.join(base, f"{name}.lnk.disabled")
+                    op = dp.replace(".disabled", "")
+                    if os.path.exists(dp):
+                        try:
+                            if os.path.exists(op):
+                                self.startup_log_widget.appendPlainText(f"[Startup][Skip] {op} exists")
+                            else:
+                                os.rename(dp, op)
+                                restored = True
+                                self.startup_log_widget.appendPlainText(f"[Startup] Restored {op}")
+                        except PermissionError:
+                            shutil.copy2(dp, op)
+                            os.remove(dp)
+                            restored = True
+                            self.startup_log_widget.appendPlainText(f"[Startup][Fallback] Copied {op}")
+                if restored:
+                    self._set_startup_approval(winreg.HKEY_CURRENT_USER, None, name, "enable", True)
+            self._update_startup_tab()
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to delete startup entry {name}:\n{e}")
-            self.startup_log_widget.appendPlainText(f"[Startup][Error] Failed to delete {name}: {e}")
+            self.startup_log_widget.appendPlainText(f"[Startup][Error] Enable failed {name}: {e}")
 
+    # --- Delete Entry ---
+    def _delete_startup_entry_ui(self, hive, path, name):
+        """Delete startup entry everywhere."""
+        self._set_startup_approval(hive, path, name, "delete", not path)
+        try:
+            if path:
+                for target in [path, path.replace("Run", "RunDisabled")]:
+                    try:
+                        with winreg.OpenKey(hive, target, 0, winreg.KEY_SET_VALUE) as key:
+                            winreg.DeleteValue(key, name)
+                            self.startup_log_widget.appendPlainText(f"[Startup] Deleted {name} from {target}")
+                    except FileNotFoundError:
+                        pass
+            else:
+                for base in [
+                    os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
+                    os.path.join(os.environ["ProgramData"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
+                ]:
+                    for ext in [".lnk", ".lnk.disabled"]:
+                        p = os.path.join(base, f"{name}{ext}")
+                        if os.path.exists(p):
+                            os.remove(p)
+                            self.startup_log_widget.appendPlainText(f"[Startup] Deleted {p}")
+        except Exception as e:
+            self.startup_log_widget.appendPlainText(f"[Startup][Error] Delete failed {name}: {e}")
         self._update_startup_tab()
 
+    # --- Quick Repair ---
+    def _repair_startup_sync(self):
+        """Auto-fix mismatched registry/files (.lnk.disabled vs StartupApproved)."""
+        self.startup_log_widget.appendPlainText("[Startup] Running QuickSync Repair...")
+        try:
+            self._update_startup_tab()
+            # Could iterate entries and re-sync approval byte if mismatch found
+            self.startup_log_widget.appendPlainText("[Startup] QuickSync completed.")
+        except Exception as e:
+            self.startup_log_widget.appendPlainText(f"[Startup][Error] QuickSync failed: {e}")
+
+    # --- Kill Process ---
     def _kill_startup_process_ui(self, name, cmd):
         try:
             killed = []
-            target_exe = None
-
-            # Try to extract exe from command line
+            target = None
             if cmd:
                 parts = cmd.strip('"').split('"')
                 if parts:
-                    target_exe = parts[0] if os.path.isfile(parts[0]) else None
-
-            for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
+                    target = parts[0] if os.path.isfile(parts[0]) else None
+            for p in psutil.process_iter(['pid', 'name', 'exe', 'cmdline']):
                 try:
-                    if target_exe and proc.info['exe'] and proc.info['exe'].lower() == target_exe.lower():
-                        proc.terminate()
-                        killed.append(proc.info['pid'])
-                    elif proc.info['name'] and name.lower() in proc.info['name'].lower():
-                        proc.terminate()
-                        killed.append(proc.info['pid'])
-                    elif proc.info['cmdline'] and cmd and any(cmd_part in " ".join(proc.info['cmdline']) for cmd_part in [name, cmd]):
-                        proc.terminate()
-                        killed.append(proc.info['pid'])
+                    if target and p.info['exe'] and p.info['exe'].lower() == target.lower():
+                        p.terminate(); killed.append(p.info['pid'])
+                    elif p.info['name'] and name.lower() in p.info['name'].lower():
+                        p.terminate(); killed.append(p.info['pid'])
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-
-            if killed:
-                QMessageBox.information(self, "Process Killed", f"Killed process(es) for {name}: {killed}")
-            else:
-                QMessageBox.information(self, "Not Found", f"No running process found for {name}")
-
+            msg = f"Killed {len(killed)} process(es)" if killed else "No process found"
+            QMessageBox.information(self, "Kill Result", msg)
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to kill process {name}:\n{e}")
+            QMessageBox.warning(self, "Error", str(e))
 
-    def set_startup_status(self, hive, path, name, enabled=True, cmd=None):
-        """
-        Enable or disable a startup entry by writing into StartupApproved.
-        """
-        try:
-            approved_path = path.replace("Run", r"Explorer\StartupApproved\Run")
-            with winreg.OpenKey(hive, approved_path, 0, winreg.KEY_SET_VALUE) as key:
-                if enabled:
-                    data = bytes([0x02]) + b"\x00" * 11   # Enabled
-                else:
-                    data = bytes([0x03]) + b"\x00" * 11   # Disabled
-                winreg.SetValueEx(key, name, 0, winreg.REG_BINARY, data)
-
-            # Re-add if missing and enabling
-            if enabled and cmd:
-                try:
-                    with winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE) as key:
-                        winreg.SetValueEx(key, name, 0, winreg.REG_SZ, cmd)
-                except OSError:
-                    pass
-
-            return True, f"Startup entry '{name}' set to {'Enabled' if enabled else 'Disabled'}"
-        except Exception as e:
-            return False, f"Failed to update startup entry {name}: {e}"
-
-    def delete_startup_entry(self, hive, path, name):
-        """
-        Permanently delete a startup entry from both Run and StartupApproved (registry/folder).
-        """
-        try:
-            if path:  # Registry Run entry
-                # Delete from Run key
-                try:
-                    with winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE) as key:
-                        winreg.DeleteValue(key, name)
-                except FileNotFoundError:
-                    pass
-
-                # Delete from StartupApproved\Run
-                try:
-                    approved_path = path.replace("Run", r"Explorer\StartupApproved\Run")
-                    with winreg.OpenKey(hive, approved_path, 0, winreg.KEY_SET_VALUE) as key:
-                        winreg.DeleteValue(key, name)
-                except FileNotFoundError:
-                    pass
-
-            else:  # Startup Folder entry
-                startup_paths = [
-                    os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
-                    os.path.join(os.environ["ProgramData"], r"Microsoft\Windows\Start Menu\Programs\Startup")
-                ]
-
-                # Remove shortcut file
-                for spath in startup_paths:
-                    shortcut = os.path.join(spath, f"{name}.lnk")
-                    if os.path.exists(shortcut):
-                        try:
-                            os.remove(shortcut)
-                        except Exception:
-                            pass
-
-                # Remove from StartupApproved\StartupFolder
-                approved_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
-                try:
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, approved_path, 0, winreg.KEY_SET_VALUE) as key:
-                        try:
-                            winreg.DeleteValue(key, name)
-                        except FileNotFoundError:
-                            pass
-                except FileNotFoundError:
-                    pass
-
-        except Exception:
-            return False, f"Failed to delete startup entry '{name}'"
-        return True, f"Startup entry '{name}' deleted"
-
-    def _open_startup_command_path_ui(self, cmd):
-        import shlex
-        try:
-            parts = shlex.split(cmd)
-            path = parts[0]
-        except Exception:
-            path = cmd
-
-        if path and os.path.exists(path):
-            try:
-                subprocess.Popen(["explorer", "/select,", path])
-            except Exception:
-                try:
-                    subprocess.Popen(f'explorer /select,"{path}"')
-                except Exception as e:
-                    QMessageBox.warning(self, "Open Failed", str(e))
-        else:
-            QMessageBox.information(self, "Open Path", f"Path not found: {path}")
-
+    # --- Update Startup Tab ---
     def _update_startup_tab(self):
-        import psutil, os, winreg, shutil
+        show_only_enabled = getattr(self, "chk_startup_enabled_only", None)
+        show_only_enabled = show_only_enabled and show_only_enabled.isChecked()
 
-        # --- Collect Registry Entries ---
-        entries = self.sugg.list_registry_startup()  # returns tuples: (hive, path, name, cmd)
+        # Collect registry startup entries
+        entries = self.sugg.list_registry_startup()
 
-        # Deduplicate registry items
-        seen = set()
-        unique_entries = []
+        # Dedup registry entries
+        seen = set(); uniq = []
         for e in entries:
-            hive, path, name, cmd = e
-            key = (str(name).lower(), str(cmd or "").lower())
-            if key not in seen:
-                seen.add(key)
-                unique_entries.append(e)
-        entries = unique_entries
+            k = (e[2].lower(), str(e[3] or "").lower())
+            if k not in seen:
+                seen.add(k)
+                uniq.append(e)
+        entries = uniq
 
-        # --- Collect Startup Folder Entries ---
-        startup_folders = [
-            os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
-            os.path.join(os.environ["ProgramData"], r"Microsoft\Windows\Start Menu\Programs\Startup"),
-        ]
-
-        folder_entries = []
-        for sdir in startup_folders:
+        # Collect Startup Folder entries
+        for sdir in [
+            os.path.join(os.environ["APPDATA"], r"Microsoft\\Windows\\Start Menu\\Programs\\Startup"),
+            os.path.join(os.environ["ProgramData"], r"Microsoft\\Windows\\Start Menu\\Programs\\Startup"),
+        ]:
             if not os.path.exists(sdir):
                 continue
-            for entry in os.listdir(sdir):
-                if not entry.lower().endswith(".lnk") and not entry.lower().endswith(".lnk.disabled"):
+            for f in os.listdir(sdir):
+                if not f.lower().endswith((".lnk", ".lnk.disabled")):
                     continue
-                fullpath = os.path.join(sdir, entry)
-                name = os.path.splitext(entry)[0].replace(".lnk", "").replace(".disabled", "")
-                folder_entries.append((None, None, name, fullpath))
+                name = f.replace(".lnk.disabled", "").replace(".lnk", "")
+                entries.append((None, None, name, os.path.join(sdir, f)))
 
-        # Merge (Registry + Folder)
-        entries.extend(folder_entries)
-
-        # Deduplicate across all
-        seen_all = set()
-        final_entries = []
+        # Smart dedup
+        merged = {}
         for e in entries:
             hive, path, name, cmd = e
-            key = (str(name).lower(), str(cmd or "").lower())
-            if key not in seen_all:
-                seen_all.add(key)
-                final_entries.append(e)
+            cmd_str = str(cmd or "").lower()
+            norm_cmd = cmd_str.replace("progra~1", "program files").replace("progra~2", "program files (x86)")
+            exe_name = None
+            try:
+                if norm_cmd.endswith(".lnk") and os.path.exists(cmd):
+                    exe_name = os.path.splitext(os.path.basename(norm_cmd))[0]
+                else:
+                    parts = norm_cmd.replace('"', '').split()
+                    if parts:
+                        exe_name = os.path.basename(parts[0])
+            except Exception:
+                exe_name = os.path.basename(norm_cmd) if norm_cmd else name.lower()
+            dedup_key = f"{exe_name}:{name.lower().strip()}"
+            if dedup_key not in merged:
+                merged[dedup_key] = e
+            else:
+                old = merged[dedup_key]
+                old_cmd = str(old[3] or "").lower()
+                if (".lnk" in norm_cmd and ".lnk" not in old_cmd) or ("startup" in norm_cmd and "run" in old_cmd):
+                    merged[dedup_key] = e
 
-        entries = final_entries
+        entries = list(merged.values())
 
-        # --- Setup Table ---
+        # Table setup
         self.table_startup.setRowCount(0)
         self.table_startup.setColumnCount(6)
         self.table_startup.setHorizontalHeaderLabels(
             ["Name", "Location", "Command", "Startup Status", "Running", "Manage"]
         )
 
-        for r, (hive, path, name, cmd) in enumerate(entries):
-            self.table_startup.insertRow(r)
+        row_data_list = []
 
-            # Name
-            self.table_startup.setItem(r, 0, QTableWidgetItem(str(name)))
+        # Collect all rows
+        for (hive, path, name, cmd) in entries:
+            loc = "Startup Folder" if not path else f"{'HKCU' if hive == winreg.HKEY_CURRENT_USER else 'HKLM'}: {path}"
 
-            # Location
-            if path:
-                hive_str = {
-                    winreg.HKEY_CURRENT_USER: "HKCU",
-                    winreg.HKEY_LOCAL_MACHINE: "HKLM",
-                }.get(hive, str(hive))
-                regloc = f"{hive_str}: {path}"
-            else:
-                regloc = "Startup Folder"
-            self.table_startup.setItem(r, 1, QTableWidgetItem(regloc))
-
-            # Command
-            self.table_startup.setItem(r, 2, QTableWidgetItem(str(cmd)))
-
-            # --- Enabled/Disabled Detection ---
+            # --- Startup Status ---
             status = "Enabled"
             try:
                 if path:
-                    # Registry entry: check StartupApproved\Run
-                    approved_path = path.replace("Run", r"Explorer\\StartupApproved\\Run")
-                    with winreg.OpenKey(hive, approved_path, 0, winreg.KEY_READ) as key:
-                        val, _ = winreg.QueryValueEx(key, name)
-                        if isinstance(val, (bytes, bytearray)) and len(val) > 0:
-                            if val[0] == 0x03:
-                                status = "Disabled"
+                    ap = self._get_approval_path(path)
+                    with winreg.OpenKey(hive, ap, 0, winreg.KEY_READ) as k:
+                        v, _ = winreg.QueryValueEx(k, name)
+                        if v[0] == 0x03:
+                            status = "Disabled"
                 else:
-                    # Folder entry: check file suffix or StartupApproved\StartupFolder
-                    if cmd and str(cmd).lower().endswith(".lnk.disabled"):
+                    if cmd and ".disabled" in str(cmd).lower():
                         status = "Disabled"
                     else:
-                        approved_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
-                        try:
-                            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, approved_path, 0, winreg.KEY_READ) as key:
-                                val, _ = winreg.QueryValueEx(key, name)
-                                if isinstance(val, (bytes, bytearray)) and len(val) > 0:
-                                    status = "Disabled" if val[0] == 0x03 else "Enabled"
-                        except FileNotFoundError:
-                            pass
+                        ap = self._get_approval_path(None, True)
+                        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ap, 0, winreg.KEY_READ) as k:
+                            v, _ = winreg.QueryValueEx(k, name)
+                            if v[0] == 0x03:
+                                status = "Disabled"
             except FileNotFoundError:
-                status = "Enabled"
-            except OSError:
-                status = "Unknown"
+                pass
+            except Exception as e:
+                print(f"[Startup][Warn] Failed reading status for {name}: {e}")
 
-            self.table_startup.setItem(r, 3, QTableWidgetItem(status))
+            if show_only_enabled and status != "Enabled":
+                continue  # skip disabled entries if filter on
 
-            # --- Running Detection ---
-            running = "Not Running"
+            # --- Running Status ---
+            run = "Not Running"
+            exe_candidates = set()
+
+            if cmd:
+                cmd_str = str(cmd).replace('"', '').strip().lower()
+                parts = cmd_str.split()
+                if parts:
+                    # Take the base exe name and its variants
+                    base = os.path.basename(parts[0])
+                    name_only = os.path.splitext(base)[0]
+                    exe_candidates.update({base, name_only, f"{name_only}.exe"})
+
             try:
-                exe_name = None
-                if cmd:
-                    # Extract basename safely
-                    parts = str(cmd).replace('"', '').split()
-                    if parts:
-                        exe_name = os.path.basename(parts[0]).lower()
+                for p in psutil.process_iter(['name', 'exe', 'cmdline']):
+                    pname = (p.info.get('name') or '').lower()
+                    pexe = os.path.basename((p.info.get('exe') or '')).lower()
+                    pcmd = ' '.join(p.info.get('cmdline') or []).lower()
 
-                if exe_name:
-                    for proc in psutil.process_iter(['name', 'exe', 'cmdline']):
-                        pname = (proc.info['name'] or "").lower()
-                        pexe = (proc.info['exe'] or "").lower()
-                        pcmd = " ".join(proc.info['cmdline'] or []).lower()
-                        if exe_name in pname or exe_name in pexe or exe_name in pcmd:
-                            running = "Running"
-                            break
+                    # Match if any candidate in process name, exe path, or cmdline
+                    if any(
+                        cand in pname or cand in pexe or cand in pcmd
+                        for cand in exe_candidates
+                    ):
+                        run = "Running"
+                        break
             except Exception:
                 pass
 
-            self.table_startup.setItem(r, 4, QTableWidgetItem(running))
-
-            # --- Manage button ---
-            btn = QToolButton()
-            btn.setText("Manage")
-            btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-
+            # --- Manage Menu ---
+            btn = QToolButton(); btn.setText("Manage")
             menu = QMenu(btn)
-            act_disable = QAction("Disable", self)
-            act_enable = QAction("Enable", self)
-            act_delete = QAction("Delete Entry", self)
-            act_open = QAction("Open Command Path", self)
-            act_kill = QAction("Kill Process", self)
 
-            act_disable.triggered.connect(partial(self._disable_startup_entry_ui, hive, path, name))
-            act_enable.triggered.connect(partial(self._enable_startup_entry_ui, hive, path, name, cmd))
-            act_delete.triggered.connect(partial(self._delete_startup_entry_ui, hive, path, name))
-            act_open.triggered.connect(partial(self._open_startup_command_path_ui, cmd))
-            act_kill.triggered.connect(partial(self._kill_startup_process_ui, name, cmd))
+            if status == "Enabled":
+                toggle_label = "Disable"
+                toggle_func = partial(self._disable_startup_entry_ui, hive, path, name)
+            else:
+                toggle_label = "Enable"
+                toggle_func = partial(self._enable_startup_entry_ui, hive, path, name, cmd)
 
-            menu.addAction(act_disable)
-            menu.addAction(act_enable)
-            menu.addAction(act_delete)
-            menu.addAction(act_open)
-            menu.addAction(act_kill)
+            act_toggle = QAction(toggle_label, self)
+            act_toggle.triggered.connect(toggle_func)
+            menu.addAction(act_toggle)
+
+            for label, func in {
+                "Delete": partial(self._delete_startup_entry_ui, hive, path, name),
+                "Kill": partial(self._kill_startup_process_ui, name, cmd),
+                "Repair": self._repair_startup_sync,
+            }.items():
+                act = QAction(label, self)
+                act.triggered.connect(func)
+                menu.addAction(act)
 
             btn.setMenu(menu)
-            self.table_startup.setCellWidget(r, 5, btn)
+            btn.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
 
-        # --- Log Update ---
-        # self.startup_log_widget.appendPlainText(f"Refreshed startup list: {len(entries)} entries")
+            row_data_list.append((name, loc, str(cmd), status, run, btn))
+
+        # ✅ Sort by Running, then Name
+        row_data_list.sort(key=lambda r: (r[4] != "Running", r[0].lower()))
+
+        # Populate sorted table with color highlighting
+        for r, row in enumerate(row_data_list):
+            self.table_startup.insertRow(r)
+            for c, value in enumerate(row):
+                if isinstance(value, QToolButton):
+                    self.table_startup.setCellWidget(r, c, value)
+                else:
+                    item = QTableWidgetItem(value)
+                    # 🟢 Green for Running, 🔴 Red for Not Running
+                    if c == 4:  # Running column
+                        if value == "Running":
+                            item.setForeground(QColor("green"))
+                        else:
+                            item.setForeground(QColor("red"))
+                    self.table_startup.setItem(r, c, item)
+
+        self.startup_log_widget.appendPlainText(
+            f"[Startup] Table sorted by Running. Filter={'Enabled only' if show_only_enabled else 'All'}."
+        )
+
+    #---------  Others  --------------#
 
     def _update_services_tab(self):
         try:
