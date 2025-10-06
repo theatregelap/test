@@ -1,46 +1,42 @@
 #!/usr/bin/env python3
 """
-ebay_ai_seller_ultimate.py
+ebay_ai_seller_ultimate.py Ultimate AI eBay Seller Assistant (PyQt5)
 
-Ultimate AI eBay Seller Assistant (PyQt5)
 Features:
- - Tab A: Manage local supplier items (CSV import/export, add/remove)
- - Tab B: Market Research (eBay Finding API) per marketplace & keyword
- - Tab C: AI Smart Match & AI Rank, TOP 5 summary + bar chart
- - Tab D: Sell on eBay (OAuth2) -> create inventory item, create offer, publish offer
- - Price optimizer (rule-based + competitor-aware)
- - Shipping estimator (simple per-100g rates, editable)
- - Trending scraper stub (import CSV from Shopee/Lazada) + cross-check
- - Report export (CSV + chart PNG)
- - Smart alerts via Telegram (optional, set TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID in .env)
- - Uses sandbox by default (change EBAY_ENV to 'production' for live)
+- Tab A: Manage local supplier items (CSV import/export, add/remove)
+- Tab B: Market Research (eBay Finding API or Browse API if OAuth credentials exist) per marketplace & keyword
+- Tab C: AI Smart Match & AI Rank, TOP 5 summary + bar chart
+- Tab D: Sell on eBay (OAuth2) -> create inventory item, create offer, publish offer
+- Price optimizer (rule-based + competitor-aware)
+- Shipping estimator (simple per-100g rates, editable)
+- Trending scraper stub (import CSV from Shopee/Lazada) + cross-check
+- Report export (CSV + chart PNG)
+- Smart alerts via Telegram (optional)
+- Uses sandbox by default (change EBAY_ENV to 'production' for live)
 
-Requirements:
- pip install PyQt5 requests pandas matplotlib
+Requirements: pip install PyQt5 requests pandas matplotlib
 
-IMPORTANT: Replace EBAY_APP_ID/CLIENT_SECRET/REDIRECT_URI in .env
+IMPORTANT: Replace EBAY_APP_ID/CLIENT_SECRET/REDIRECT_URI in settings.json
 """
 
 import os
 import sys
 import math
 import json
-import openai
 import time
 import webbrowser
 import traceback
+import base64
 from typing import List, Tuple, Dict, Any, Optional
 from dataclasses import dataclass
 
 import requests
 import pandas as pd
-
-
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
-    QFileDialog, QMessageBox, QComboBox, QTextEdit, QSpinBox, QDoubleSpinBox,
-    QInputDialog
+    QTabWidget, QLabel, QLineEdit, QPushButton, QTableWidget,
+    QTableWidgetItem, QFileDialog, QMessageBox, QComboBox, QTextEdit,
+    QSpinBox, QDoubleSpinBox, QInputDialog
 )
 from PyQt5.QtCore import Qt
 
@@ -51,21 +47,21 @@ from matplotlib.figure import Figure
 with open("settings.json", "r") as f:
     SETTINGS = json.load(f)
 
-OPENAI_API_KEY = SETTINGS.get("OPENAI_API_KEY", "")
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
-
 # eBay credentials / environment (only production App ID is needed for research)
 EBAY_APP_ID = SETTINGS.get("EBAY_APP_ID", "")
-EBAY_ENV = SETTINGS.get("EBAY_ENV", "production")  # always production for Finding API
+EBAY_ENV = SETTINGS.get("EBAY_ENV", "production")
+
+# New client credentials for OAuth Browse API (placeholders in settings.json)
+EBAY_CLIENT_ID = SETTINGS.get("EBAY_CLIENT_ID", "YOUR_CLIENT_ID")
+EBAY_CLIENT_SECRET = SETTINGS.get("EBAY_CLIENT_SECRET", "YOUR_CLIENT_SECRET")
 
 # Telegram for smart alerts (optional)
 TELEGRAM_BOT_TOKEN = SETTINGS.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = SETTINGS.get("TELEGRAM_CHAT_ID", "")
 
-# Default FX placeholder (MYR -> USD/GBP/AUD). Can be updated live.
+# Default FX placeholder (MYR -> USD/GBP/AUD).
+# Can be updated live.
 DEFAULT_FX = SETTINGS.get("DEFAULT_FX", {"USD": 0.22, "GBP": 0.18, "AUD": 0.29})
-
 # Shipping default rates per 100g to target markets (in USD)
 DEFAULT_SHIPPING = SETTINGS.get("DEFAULT_SHIPPING", {"US": 1.5, "UK": 2.0, "AU": 1.8})
 
@@ -75,28 +71,21 @@ WEIGHT_COMPETITION = SETTINGS.get("WEIGHT_COMPETITION", 0.25)
 WEIGHT_PRICE = SETTINGS.get("WEIGHT_PRICE", 0.20)
 COMPETITION_MAX = SETTINGS.get("COMPETITION_MAX", 50.0)
 
-# API endpoints (research-only: always production Finding API)
+# API endpoints (support both production & sandbox)
 FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
 if EBAY_ENV.lower() == "production":
     OAUTH_AUTHORIZE = "https://auth.ebay.com/oauth2/authorize"
     OAUTH_TOKEN = "https://api.ebay.com/identity/v1/oauth2/token"
     SELL_INVENTORY_BASE = "https://api.ebay.com/sell/inventory/v1"
+    BROWSE_SEARCH = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 else:
     OAUTH_AUTHORIZE = "https://auth.sandbox.ebay.com/oauth2/authorize"
     OAUTH_TOKEN = "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
     SELL_INVENTORY_BASE = "https://api.sandbox.ebay.com/sell/inventory/v1"
+    BROWSE_SEARCH = "https://api.sandbox.ebay.com/buy/browse/v1/item_summary/search"
 
-# Default FX placeholder (MYR -> USD/GBP/AUD). We'll fetch live optionally.
-DEFAULT_FX = {"USD": 0.22, "GBP": 0.18, "AUD": 0.29}
-
-# Shipping default rates per 100g to target markets (in USD)
-DEFAULT_SHIPPING = {"US": 1.5, "UK": 2.0, "AU": 1.8}
-
-# Scoring weights for AI Rank
-WEIGHT_MARGIN = 0.55
-WEIGHT_COMPETITION = 0.25
-WEIGHT_PRICE = 0.20
-COMPETITION_MAX = 50.0  # for normalization
+# Persistent token storage
+TOKEN_FILE = "ebay_token.json"
 
 # Data classes
 @dataclass
@@ -123,7 +112,8 @@ def parse_price_string(price_str: str) -> Optional[float]:
     for ch in price_str:
         if ch.isdigit() or ch == ".":
             buf.append(ch)
-        elif ch in ",":  # skip commas
+        elif ch in ",":
+            # skip commas
             continue
     if not buf:
         return None
@@ -133,7 +123,8 @@ def parse_price_string(price_str: str) -> Optional[float]:
         return None
 
 def fetch_exchange_rate(target: str) -> Optional[float]:
-    """Fetch 1 MYR -> target currency using exchangerate.host (no key required). Return rate or None."""
+    """Fetch 1 MYR -> target currency using exchangerate.host (no key required).
+    Return rate or None."""
     try:
         resp = requests.get("https://api.exchangerate.host/convert", params={"from":"MYR","to":target,"amount":1}, timeout=8)
         resp.raise_for_status()
@@ -156,26 +147,148 @@ def send_telegram_alert(msg: str):
     except Exception:
         return False
 
-# eBay Finding API wrapper (simple)
+# ---------------- Token persistence and OAuth helpers ----------------
+
+def load_token_from_file() -> Optional[Dict[str, Any]]:
+    """Load token dict from disk if present and not expired."""
+    if not os.path.exists(TOKEN_FILE):
+        return None
+    try:
+        with open(TOKEN_FILE, "r") as f:
+            data = json.load(f)
+        if time.time() < data.get("expires_at", 0):
+            return data
+    except Exception:
+        return None
+    return None
+
+def save_token_to_file(access_token: str, expires_in: int) -> None:
+    """Save token info to TOKEN_FILE, refreshing 60s early."""
+    data = {
+        "access_token": access_token,
+        "expires_at": time.time() + int(expires_in) - 60,
+    }
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def get_ebay_token() -> Optional[str]:
+    """Return a valid OAuth token.
+
+    Priority:
+      1) If token file exists and valid -> return it
+      2) If EBAY_CLIENT_ID/SECRET provided -> request a token and cache
+      3) Return None if no credentials (caller should fallback to Finding API)
+    """
+    # 1) try token file
+    t = load_token_from_file()
+    if t and t.get("access_token"):
+        return t["access_token"]
+
+    # 2) request using client credentials
+    if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET or "YOUR_CLIENT" in EBAY_CLIENT_ID:
+        # no client credentials configured
+        return None
+
+    url = OAUTH_TOKEN
+    creds = f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}"
+    auth_header = base64.b64encode(creds.encode()).decode()
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": f"Basic {auth_header}",
+    }
+    data = {
+        "grant_type": "client_credentials",
+        # scope for Browse API search
+        "scope": "https://api.ebay.com/oauth/api_scope"
+    }
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=15)
+        resp.raise_for_status()
+        jd = resp.json()
+        access_token = jd.get("access_token")
+        expires_in = int(jd.get("expires_in", 7200))
+        if access_token:
+            save_token_to_file(access_token, expires_in)
+            return access_token
+    except Exception:
+        traceback.print_exc()
+        return None
+
+    return None
+
+# ---------------- eBay search: Browse API with Finding fallback ----------------
+
 def ebay_find_items(keyword: str, entries_per_page: int = 10, global_id: str = "EBAY-US") -> List[Tuple[str,str,str]]:
-    """Return list of (title, price_str, viewUrl). Requires EBAY_APP_ID set."""
+    """
+    Return list of (title, price_str, viewUrl).
+
+    Behavior:
+    - Primary: use Browse API (modern) if OAuth client credentials configured.
+    - Fallback: use Finding API (legacy) if Browse/OAuth not available.
+
+    This preserves the original signature so GUI code remains unchanged.
+    """
     results: List[Tuple[str,str,str]] = []
+
+    # Try Browse API first (requires OAuth token)
+    token = get_ebay_token()
+    if token:
+        try:
+            # Map global_id to marketplace header accepted by Browse API
+            # e.g., "EBAY-US" -> "EBAY_US" or use common marketplace IDs expected
+            marketplace_header = global_id.replace("-", "_")
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "X-EBAY-C-MARKETPLACE-ID": marketplace_header
+            }
+            params = {
+                "q": keyword,
+                "limit": entries_per_page
+            }
+            resp = requests.get(BROWSE_SEARCH, headers=headers, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("itemSummaries", [])
+            for it in items:
+                title = it.get("title", "")
+                price_val = None
+                currency = ""
+                price_obj = it.get("price") or {}
+                if isinstance(price_obj, dict):
+                    price_val = price_obj.get("value")
+                    currency = price_obj.get("currency") or price_obj.get("currencyCode", "")
+                if price_val is None:
+                    price_val = it.get("price", {}).get("value") if it.get("price") else None
+                price_str = f"{currency} {price_val}" if price_val is not None else ""
+                view_url = it.get("itemWebUrl") or it.get("itemHref") or ""
+                results.append((title, price_str, view_url))
+            return results
+        except Exception:
+            traceback.print_exc()
+            # fall through to Finding API fallback
+
+    # Fallback: original Finding API (legacy) using EBAY_APP_ID
     if not EBAY_APP_ID:
         return results
-    headers = {
+
+    headers_f = {
         "X-EBAY-SOA-SECURITY-APPNAME": EBAY_APP_ID,
         "X-EBAY-SOA-OPERATION-NAME": "findItemsByKeywords",
         "X-EBAY-SOA-SERVICE-VERSION": "1.0.0",
         "X-EBAY-SOA-RESPONSE-DATA-FORMAT": "JSON",
     }
-    params = {
+    params_f = {
         "keywords": keyword,
         "paginationInput.entriesPerPage": str(entries_per_page),
-        "GLOBAL-ID": global_id,
-        "outputSelector": "SellerInfo"
+        "GLOBAL-ID": global_id.replace("-", "_"),
+        "outputSelector": "SellerInfo",
+        "REST-PAYLOAD": ""
     }
     try:
-        resp = requests.get(FINDING_URL, headers=headers, params=params, timeout=15)
+        resp = requests.get(FINDING_URL, headers=headers_f, params=params_f, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         try:
@@ -183,27 +296,30 @@ def ebay_find_items(keyword: str, entries_per_page: int = 10, global_id: str = "
         except Exception:
             items = []
         for it in items:
-            title = it.get("title", [""])[0]
-            price_info = it.get("sellingStatus", [{}])[0].get("currentPrice", [{}])[0]
-            price_val = price_info.get("__value__", "0")
-            currency = price_info.get("@currencyId", "")
-            view_url = it.get("viewItemURL", [""])[0]
+            title = it.get("title", [""])[0] if isinstance(it.get("title"), list) else it.get("title", "")
+            price_info = {}
+            if isinstance(it.get("sellingStatus"), list) and it.get("sellingStatus"):
+                price_info = it.get("sellingStatus", [{}])[0].get("currentPrice", [{}])[0]
+            elif isinstance(it.get("sellingStatus"), dict):
+                price_info = it.get("sellingStatus", {}).get("currentPrice", {})
+            price_val = price_info.get("__value__", "0") if isinstance(price_info, dict) else "0"
+            currency = price_info.get("@currencyId", "") if isinstance(price_info, dict) else ""
+            view_url = it.get("viewItemURL", [""])[0] if isinstance(it.get("viewItemURL"), list) else it.get("viewItemURL", "")
             price_str = f"{currency} {price_val}"
             results.append((title, price_str, view_url))
     except Exception:
-        # silent fail - return empty list
-        pass
+        traceback.print_exc()
+
     return results
 
 # Price optimizer: rule-based using competitor prices + margin target
 def price_optimizer(local_cost_myr: float, competitor_prices_foreign: List[float], fx_rate: float, shipping_cost_foreign: float, desired_margin_pct: float = 30.0) -> Dict[str, Any]:
-    """
-    Simple optimizer:
-     - compute competitor median price (foreign currency)
-     - convert competitor median -> MYR (competitor_med * (1/fx if fx is MYR->FOREIGN?))
-       In this app we use fx = 1 MYR -> foreign ; to convert foreign -> MYR: foreign_price / fx
-     - suggest list price = min(competitor_median, competitor_median*0.95) adjusted to meet desired margin after shipping.
-     - also suggest price in foreign currency (rounded).
+    """ Simple optimizer:
+    - compute competitor median price (foreign currency)
+    - convert competitor median -> MYR (competitor_med * (1/fx if fx is MYR->FOREIGN?))
+    In this app we use fx = 1 MYR -> foreign ; to convert foreign -> MYR: foreign_price / fx
+    - suggest list price to meet desired margin after shipping.
+    - also suggest price in foreign currency (rounded).
     """
     out = {"competitor_median_foreign": None, "suggested_foreign": None, "suggested_myr": None, "expected_margin_pct": None}
     if not competitor_prices_foreign:
@@ -215,35 +331,27 @@ def price_optimizer(local_cost_myr: float, competitor_prices_foreign: List[float
         competitor_myr = med / fx_rate if fx_rate != 0 else med * (1.0 / DEFAULT_FX.get("USD", 0.22))
     except Exception:
         competitor_myr = med * (1.0 / DEFAULT_FX.get("USD", 0.22))
-    # base suggested in MYR is target to achieve desired margin after shipping (shipping in foreign currency -> convert to MYR same way)
-    # we'll compute shipping_myr = shipping_foreign / fx_rate
-    # desired: (list_myr - local_cost_myr - shipping_myr) / list_myr >= desired_margin_pct/100
-    # Solve for list_myr: list_myr >= (local_cost_myr + shipping_myr) / (1 - desired_margin)
-    # Start candidate foreign price from competitor_median * 0.98 (slightly undercut)
+    # compute shipping MYR
     shipping_myr = shipping_cost_foreign / fx_rate if fx_rate != 0 else 0.0
     desired_margin = desired_margin_pct / 100.0
     try:
         candidate_list_myr = (local_cost_myr + shipping_myr) / (1 - desired_margin) if (1 - desired_margin) > 0 else local_cost_myr * 1.5
     except Exception:
         candidate_list_myr = local_cost_myr * 1.5
-    # clamp to competitor (don't exceed competitor too much)
     candidate_list_myr = min(candidate_list_myr, competitor_myr * 1.05)
-    # foreign suggestion
     suggested_foreign = candidate_list_myr * fx_rate
     out["suggested_foreign"] = round(suggested_foreign, 2)
     out["suggested_myr"] = round(candidate_list_myr, 2)
-    # expected margin
     try:
         expected_margin = ((candidate_list_myr - local_cost_myr - shipping_myr) / candidate_list_myr) * 100.0
-    except:
+    except Exception:
         expected_margin = 0.0
     out["expected_margin_pct"] = round(expected_margin, 1)
     return out
 
 # Trending scraper stub: import CSV from Shopee/Lazada exports or do scraping (NOT implemented)
 def import_trending_csv(path: str) -> List[Dict[str, Any]]:
-    """
-    Load a CSV exported from local marketplace or your supplier list.
+    """ Load a CSV exported from local marketplace or your supplier list.
     Expected columns: name, price_myr, weight_g (optional)
     Returns list of dicts.
     """
@@ -284,16 +392,12 @@ def export_report_csv(path_csv: str, matches: List[Dict[str, Any]], chart_png_pa
 # ---------------- AI Helper ----------------
 # ai_helper_ollama.py
 import subprocess
-
 class AIHelper:
     def __init__(self, settings=None):
         self.model = (settings.get("OLLAMA_MODEL") if settings else None) or "llama3:instruct"
         self.extra_args = settings.get("OLLAMA_ARGS", []) if settings else []
-
     def _run_ollama(self, prompt: str) -> str:
-        """
-        Run Ollama model locally and return response text.
-        """
+        """ Run Ollama model locally and return response text. """
         try:
             result = subprocess.run(
                 ["ollama", "run", self.model, prompt] + self.extra_args,
@@ -306,44 +410,26 @@ class AIHelper:
             return f"❌ Exception running Ollama: {e}"
 
     # -------------------- AI Features --------------------
-
     def expand_keywords(self, product_name: str):
-        """
-        Suggest related eBay search keywords for a given product.
-        """
+        """ Suggest related eBay search keywords for a given product. """
         prompt = f"Suggest 5 short eBay search keywords related to: {product_name}. Output as a comma-separated list."
         resp = self._run_ollama(prompt)
-        # try to parse CSV-style response
         parts = [x.strip() for x in resp.replace("\n", ",").split(",") if x.strip()]
         return parts[:5] if parts else [resp]
 
     def analyze_opportunity(self, product_name: str, ebay_data, local_price_myr: float):
-        """
-        Analyze opportunity of selling product_name based on competitor listings and local supplier price.
-        """
+        """ Analyze opportunity of selling product_name based on competitor listings and local supplier price. """
         comp_lines = []
-        for title, price, url in ebay_data[:5]:  # only take top 5 to keep prompt short
+        for title, price, url in ebay_data[:5]:
             comp_lines.append(f"- {title} at {price}")
         comps = "\n".join(comp_lines)
-        prompt = f"""
-You are an expert eBay product analyst.
-
-Product: {product_name}
-Local Supplier Price (MYR): {local_price_myr}
-
-Competitor Listings:
-{comps}
-
-Question: Is this product a good selling opportunity? Consider margins, demand, and competition. 
-Give a short analysis in 3-5 bullet points.
-"""
+        prompt = f""" You are an expert eBay product analyst. Product: {product_name} Local Supplier Price (MYR): {local_price_myr} Competitor Listings: {comps} Question: Is this product a good selling opportunity? Consider margins, demand, and competition. Give a short analysis in 3-5 bullet points.
+        """
         return self._run_ollama(prompt)
 
     def forecast_trends(self, product_names):
-        """
-        Forecast short/long-term demand trends for a list of product names.
-        """
-        prompt = "Forecast demand trends for these products. Mark each as Strong, Seasonal, Declining, or Stable:\n\n"
+        """ Forecast short/long-term demand trends for a list of product names. """
+        prompt = "Forecast demand trends for these products.\n\nMark each as Strong, Seasonal, Declining, or Stable:\n\n"
         for name in product_names:
             prompt += f"- {name}\n"
         return self._run_ollama(prompt)
@@ -351,7 +437,7 @@ Give a short analysis in 3-5 bullet points.
 # ---------------- GUI Application ----------------
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__()     
+        super().__init__()
         self.setWindowTitle("AI eBay Seller Assistant — Ultimate")
         self.resize(1200, 820)
 
@@ -362,7 +448,7 @@ class MainWindow(QMainWindow):
         self.fx_cache = {}  # currency -> rate MYR->currency (1 MYR -> X foreign)
         self.shipping_rates = DEFAULT_SHIPPING.copy()
         self.ebay_access_token = None  # after OAuth
-        self.ebay_client: Optional[EbaySellClient] = None
+        self.ebay_client: Optional[Any] = None
         self.ai = AIHelper(SETTINGS)
 
         # UI
@@ -372,7 +458,6 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         v = QVBoxLayout(central)
-
         self.tabs = QTabWidget()
         v.addWidget(self.tabs)
 
@@ -405,7 +490,6 @@ class MainWindow(QMainWindow):
     # ---------- Tab A ----------
     def _build_tab_a(self):
         layout = QVBoxLayout(self.tab_a)
-
         hl = QHBoxLayout()
         btn_load_csv = QPushButton("Load suppliers CSV")
         btn_load_csv.clicked.connect(self._load_suppliers_csv)
@@ -413,7 +497,6 @@ class MainWindow(QMainWindow):
         btn_save_csv.clicked.connect(self._save_local_csv)
         btn_add = QPushButton("Add New Item")
         btn_add.clicked.connect(self._add_local_item_dialog)
-
         hl.addWidget(btn_load_csv); hl.addWidget(btn_save_csv); hl.addWidget(btn_add)
         layout.addLayout(hl)
 
@@ -441,8 +524,7 @@ class MainWindow(QMainWindow):
 
     def _load_suppliers_csv(self):
         p, _ = QFileDialog.getOpenFileName(self, "Open suppliers CSV", "", "CSV Files (*.csv);;All Files (*)")
-        if not p:
-            return
+        if not p: return
         rows = import_trending_csv(p)
         if rows:
             self.local_items = []
@@ -456,8 +538,7 @@ class MainWindow(QMainWindow):
 
     def _save_local_csv(self):
         p, _ = QFileDialog.getSaveFileName(self, "Save local items CSV", "", "CSV Files (*.csv)")
-        if not p:
-            return
+        if not p: return
         rows = []
         for it in self.local_items:
             rows.append({"sku":it.sku,"name":it.name,"price_myr":it.supplier_price_myr,"weight_g":it.weight_g,"moq":it.moq,"notes":it.notes})
@@ -485,23 +566,15 @@ class MainWindow(QMainWindow):
     def _build_tab_b(self):
         layout = QVBoxLayout(self.tab_b)
         ctrl = QHBoxLayout()
-
         self.keyword_input = QLineEdit()
         self.keyword_input.setPlaceholderText("Keyword e.g. 'powerbank'")
-
         self.market_combo = QComboBox()
         self.market_combo.addItem("US (EBAY-US)", ("EBAY-US","USD","US"))
         self.market_combo.addItem("UK (EBAY-GB)", ("EBAY-GB","GBP","UK"))
         self.market_combo.addItem("AU (EBAY-AU)", ("EBAY-AU","AUD","AU"))
-
         self.entries_spin = QSpinBox(); self.entries_spin.setRange(1,50); self.entries_spin.setValue(10)
-
-        btn_search = QPushButton("Search eBay")
-        btn_search.clicked.connect(self._on_search_ebay)
-
-        btn_fx = QPushButton("Refresh FX (live)")
-        btn_fx.clicked.connect(self._on_refresh_fx)
-
+        btn_search = QPushButton("Search eBay"); btn_search.clicked.connect(self._on_search_ebay)
+        btn_fx = QPushButton("Refresh FX (live)"); btn_fx.clicked.connect(self._on_refresh_fx)
         ctrl.addWidget(QLabel("Keyword:")); ctrl.addWidget(self.keyword_input)
         ctrl.addWidget(QLabel("Market:")); ctrl.addWidget(self.market_combo)
         ctrl.addWidget(QLabel("Entries:")); ctrl.addWidget(self.entries_spin)
@@ -531,14 +604,15 @@ class MainWindow(QMainWindow):
 
         # --- AI keyword expansion (Ollama) ---
         if hasattr(self, "ai"):
-            keywords = self.ai.expand_keywords(kw)
-            self._log(f"🤖 AI suggests related keywords: {', '.join(keywords)}")
-
+            try:
+                keywords = self.ai.expand_keywords(kw)
+                self._log(f" AI suggests related keywords: {', '.join(keywords)}")
+            except Exception:
+                keywords = [kw]
         idx = self.market_combo.currentIndex()
         global_id, curr, short = self.market_combo.itemData(idx)
         entries = int(self.entries_spin.value())
         self._log(f"Searching eBay {global_id} for '{kw}' ...")
-
         items = ebay_find_items(kw, entries_per_page=entries, global_id=global_id)
         self.last_results = items
         self.last_market_currency = curr
@@ -552,7 +626,6 @@ class MainWindow(QMainWindow):
             self.market_table.setItem(i, 1, QTableWidgetItem(str(val)))
             self.market_table.setItem(i, 2, QTableWidgetItem(curr))
             self.market_table.setItem(i, 3, QTableWidgetItem(url))
-
         self._log(f"Found {len(items)} results")
 
         # auto-run AI match
@@ -562,19 +635,12 @@ class MainWindow(QMainWindow):
     def _build_tab_c(self):
         layout = QVBoxLayout(self.tab_c)
         top = QHBoxLayout()
-
         self.min_margin_spin = QDoubleSpinBox(); self.min_margin_spin.setRange(-1000,10000); self.min_margin_spin.setValue(0)
         self.min_margin_spin.setSuffix(" %")
         top.addWidget(QLabel("Min margin % filter:")); top.addWidget(self.min_margin_spin)
-
-        btn_run = QPushButton("Run AI Match")
-        btn_run.clicked.connect(lambda: self._run_ai_match(auto=False))
-        top.addWidget(btn_run)
-
-        btn_export = QPushButton("Export Report (CSV + PNG)")
-        btn_export.clicked.connect(self._export_report)
-        top.addWidget(btn_export)
-
+        btn_run = QPushButton("Run AI Match"); btn_run.clicked.connect(lambda: self._run_ai_match(auto=False))
+        btn_export = QPushButton("Export Report (CSV + PNG)"); btn_export.clicked.connect(self._export_report)
+        top.addWidget(btn_run); top.addWidget(btn_export)
         layout.addLayout(top)
 
         self.match_table = QTableWidget(0,10)
@@ -617,6 +683,7 @@ class MainWindow(QMainWindow):
 
         matches = []
         max_price_foreign = max([p for p in competitor_prices]) if competitor_prices else 0.0
+
         for it in self.local_items:
             for title, price_str, url in self.last_results:
                 pf = parse_price_string(price_str) or 0.0
@@ -688,7 +755,7 @@ class MainWindow(QMainWindow):
         if top5:
             best = top5[0]
             if best["margin_pct"] >= 200:
-                msg = f"🔥 High-margin alert: {best['local_name']} SKU {best['local_sku']} margin {best['margin_pct']}% on {curr}"
+                msg = f" High-margin alert: {best['local_name']} SKU {best['local_sku']} margin {best['margin_pct']}% on {curr}"
                 send_telegram_alert(msg)
                 self._log("Smart alert sent (if Telegram configured).")
 
@@ -697,19 +764,15 @@ class MainWindow(QMainWindow):
 
         # --- AI Analysis with Ollama ---
         if hasattr(self, "ai") and top5:
-            analysis = self.ai.analyze_opportunity(
-                top5[0]['local_name'],
-                self.last_results,
-                top5[0]['local_myr']
-            )
-            self._log(f"🤖 AI Analysis:\n{analysis}")
+            analysis = self.ai.analyze_opportunity(top5[0]['local_name'], self.last_results, top5[0]['local_myr'])
+            self._log(f" AI Analysis:\n{analysis}")
 
         if auto:
             self.tabs.setCurrentIndex(2)
 
     def _export_report(self):
         if not hasattr(self,"_last_matches") or not self._last_matches:
-            QMessageBox.information(self,"No data","No matches to export. Run AI Match first.")
+            QMessageBox.information(self,"No data","No matches to export.\nRun AI Match first.")
             return
         p, _ = QFileDialog.getSaveFileName(self,"Save report CSV","ai_report.csv","CSV Files (*.csv)")
         if not p: return
@@ -734,16 +797,19 @@ class MainWindow(QMainWindow):
         btn_alerts.clicked.connect(self._configure_alerts)
         hl.addWidget(btn_import); hl.addWidget(btn_alerts)
         layout.addLayout(hl)
+
         self.trending_table = QTableWidget(0,4)
         self.trending_table.setHorizontalHeaderLabels(["Name","Price MYR","Weight g","Notes"])
         layout.addWidget(self.trending_table)
+
         self.btn_crosscheck = QPushButton("Cross-check trending vs eBay demand (keyword search)")
         self.btn_crosscheck.clicked.connect(self._crosscheck_trending)
         layout.addWidget(self.btn_crosscheck)
+
         # --- NEW: AI Forecast label ---
         self.trending_forecast_label = QLabel("AI Profitability Forecast will appear here...")
         self.trending_forecast_label.setWordWrap(True)
-        layout.addWidget(self.trending_forecast_label)        
+        layout.addWidget(self.trending_forecast_label)
 
     def _import_trending_csv(self):
         p,_ = QFileDialog.getOpenFileName(self,"Open trending CSV","","CSV Files (*.csv)")
@@ -765,7 +831,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "ai") and rows:
             names = [r.get("name","") for r in rows if r.get("name")]
             forecast = self.ai.forecast_trends(names)
-            self._log(f"📊 AI Forecast:\n{forecast}")        
+            self._log(f" AI Forecast:\n{forecast}")
 
     def _configure_alerts(self):
         token, ok = QInputDialog.getText(self,"Telegram Bot Token","Enter Telegram Bot Token (or leave blank):")
@@ -782,20 +848,20 @@ class MainWindow(QMainWindow):
         if not hasattr(self,"trend_data") or not self.trend_data:
             QMessageBox.information(self,"No data","Import trending CSV first.")
             return
+
         # For each trending local item, search eBay using its name and record top match margin
         report = []
         for r in self.trend_data:
             name = r.get("name","")
             price_myr = r.get("price_myr",0.0)
             self.keyword_input.setText(name)
-            # call finding API for name, 5 entries
+            # call ebay_find_items for name, 5 entries
             items = ebay_find_items(name, entries_per_page=5, global_id="EBAY-US")
             if not items:
                 continue
             # compute simple best margin with US default fx
             curr = "USD"
             fx = fetch_exchange_rate(curr) or DEFAULT_FX.get(curr,0.22)
-            # take top competitor price numeric
             comp_prices = [parse_price_string(it[1]) for it in items if parse_price_string(it[1]) is not None]
             if not comp_prices:
                 continue
@@ -803,6 +869,7 @@ class MainWindow(QMainWindow):
             target_rm = med / fx if fx!=0 else med / DEFAULT_FX.get(curr,0.22)
             margin = ((target_rm - price_myr)/price_myr)*100 if price_myr>0 else -999
             report.append({"name":name,"local_myr":price_myr,"comp_med_foreign":med,"comp_med_rm":round(target_rm,2),"margin_pct":round(margin,1)})
+
         # show report
         if report:
             df = pd.DataFrame(report)
@@ -815,14 +882,12 @@ class MainWindow(QMainWindow):
             # --- AI Profitability Forecast (Ollama) ---
             if hasattr(self, "ai"):
                 lines = []
-                for row in report[:10]:  # limit to top 10 to keep prompt short
+                for row in report[:10]:
                     lines.append(f"- {row['name']}: margin {row['margin_pct']}% (local MYR {row['local_myr']}, comp RM {row['comp_med_rm']})")
-                prompt = "You are an expert eBay analyst.\n\nCrosscheck results:\n" + "\n".join(lines) + \
-                        "\n\nQuestion: Which 2-3 products look most profitable and sustainable? Give a short ranked summary."
+                prompt = "You are an expert eBay analyst.\n\nCrosscheck results:\n" + "\n".join(lines) + "\n\nQuestion: Which 2-3 products look most profitable and sustainable? Give a short ranked summary."
                 forecast = self.ai._run_ollama(prompt)
-                self._log(f"📊 AI Profitability Forecast:\n{forecast}")
-                self.trending_forecast_label.setText(f"📊 AI Forecast:\n{forecast}")
-
+                self._log(f" AI Profitability Forecast:\n{forecast}")
+                self.trending_forecast_label.setText(f" AI Forecast:\n{forecast}")
         else:
             QMessageBox.information(self,"No matches","No crosscheck results found.")
 
